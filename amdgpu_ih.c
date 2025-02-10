@@ -51,6 +51,7 @@ int amdgpu_ih_ring_init(struct amdgpu_device *adev, struct amdgpu_ih_ring *ih,
 	ih->ptr_mask = ih->ring_size - 1;
 	ih->rptr = 0;
 	ih->use_bus_addr = use_bus_addr;
+	atomic_set(&ih->last_rptr, 0);
 
 	if (use_bus_addr) {
 		dma_addr_t dma_addr;
@@ -173,6 +174,7 @@ restart_ih:
 	if (wptr != ih->rptr)
 		goto restart_ih;
 
+	atomic_set(&ih->last_rptr, ih->rptr);
 	return IRQ_HANDLED;
 }
 

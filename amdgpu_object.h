@@ -25,6 +25,12 @@
  *          Alex Deucher
  *          Jerome Glisse
  */
+
+/*
+* @file amdgpu_object.h
+* @copyright 2020 Samsung Electronics
+*/
+
 #ifndef __AMDGPU_OBJECT_H__
 #define __AMDGPU_OBJECT_H__
 
@@ -112,6 +118,20 @@ struct amdgpu_bo {
 	struct list_head		shadow_list;
 
 	struct kgd_mem                  *kfd_bo;
+
+#ifdef CONFIG_DRM_SGPU_BPMD
+	uint32_t			bpmd_packet_id;
+	/* bpmd_list
+	 *
+	 * the list is used to store all BOs that will be dumped within a BPMD
+	 * execution, user-space or kernel-space ones. This was originaly
+	 * in bo_va but was moved here so that BOs not associated with a bo_va
+	 * can be treated in the same way. It also has the advantage of having
+	 * a single dump of a BO in case multiple processes share the same
+	 * amdgpu_bo through different amdgpu_bo_va.
+	 */
+	struct list_head		bpmd_list;
+#endif	/* CONFIG_DRM_SGPU_BPMD */
 };
 
 static inline struct amdgpu_bo *ttm_to_amdgpu_bo(struct ttm_buffer_object *tbo)
@@ -254,6 +274,11 @@ int amdgpu_bo_create_kernel(struct amdgpu_device *adev,
 			    unsigned long size, int align,
 			    u32 domain, struct amdgpu_bo **bo_ptr,
 			    u64 *gpu_addr, void **cpu_addr);
+int amdgpu_bo_create_kernel_dmabuf(struct amdgpu_device *adev,
+				   struct amdgpu_bo_param *bp,
+				   struct amdgpu_bo **bo_ptr,
+				   void *vaddr, dma_addr_t dma_addr,
+				   u64 *gpu_addr);
 int amdgpu_bo_create_kernel_at(struct amdgpu_device *adev,
 			       uint64_t offset, uint64_t size, uint32_t domain,
 			       struct amdgpu_bo **bo_ptr, void **cpu_addr);

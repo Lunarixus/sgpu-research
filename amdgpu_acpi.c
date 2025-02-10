@@ -773,6 +773,9 @@ int amdgpu_acpi_init(struct amdgpu_device *adev)
 	struct amdgpu_atcs *atcs = &adev->atcs;
 	int ret;
 
+	if (!adev->pdev)
+		return 0;
+
 	/* Get the device handle */
 	handle = ACPI_HANDLE(&adev->pdev->dev);
 

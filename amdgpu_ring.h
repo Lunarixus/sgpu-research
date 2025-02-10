@@ -1,5 +1,5 @@
 /*
- * Copyright 2016 Advanced Micro Devices, Inc.
+ * Copyright 2016-2021 Advanced Micro Devices, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -29,15 +29,19 @@
 #include <drm/drm_print.h>
 
 /* max number of rings */
-#define AMDGPU_MAX_RINGS		28
+#define AMDGPU_MAX_RINGS		145
 #define AMDGPU_MAX_HWIP_RINGS		8
-#define AMDGPU_MAX_GFX_RINGS		2
+#define AMDGPU_MAX_GFX_RINGS		4
 #define AMDGPU_MAX_COMPUTE_RINGS	8
 #define AMDGPU_MAX_VCE_RINGS		3
 #define AMDGPU_MAX_UVD_ENC_RINGS	2
+#define AMDGPU_MAX_CWSR_RINGS          128
 
 #define AMDGPU_RING_PRIO_DEFAULT	1
 #define AMDGPU_RING_PRIO_MAX		AMDGPU_GFX_PIPE_PRIO_MAX
+
+#define AMDGPU_GFX_RING_PRIO_LOW	0
+#define AMDGPU_GFX_RING_PRIO_HIGH	1
 
 /* some special values for the owner field */
 #define AMDGPU_FENCE_OWNER_UNDEFINED	((void *)0ul)
@@ -88,6 +92,29 @@ struct amdgpu_sched {
 	struct drm_gpu_scheduler	*sched[AMDGPU_MAX_HWIP_RINGS];
 };
 
+/* software scheduler */
+enum sws_sched_priority {
+	SWS_SCHED_PRIORITY_LOW,
+	SWS_SCHED_PRIORITY_NORMAL,
+	SWS_SCHED_PRIORITY_HIGH,
+	SWS_SCHED_PRIORITY_TUNNEL,
+	SWS_SCHED_PRIORITY_MAX,
+};
+
+struct amdgpu_sws_ctx {
+	struct list_head list;
+	struct amdgpu_ctx *ctx;
+	struct amdgpu_ring *ring;
+
+	enum sws_sched_priority priority;
+	u32 sched_num;
+	u32 sched_round_begin;
+
+	u32 reset_num;
+	u32 timeout_num;
+	u32 queue_state;
+};
+
 /*
  * Fences.
  */
@@ -115,6 +142,8 @@ int amdgpu_fence_driver_init_ring(struct amdgpu_ring *ring,
 int amdgpu_fence_driver_start_ring(struct amdgpu_ring *ring,
 				   struct amdgpu_irq_src *irq_src,
 				   unsigned irq_type);
+void amdgpu_fence_driver_deinit_ring(struct amdgpu_ring *ring);
+void amdgpu_fence_driver_deinit_ring(struct amdgpu_ring *ring);
 void amdgpu_fence_driver_suspend(struct amdgpu_device *adev);
 void amdgpu_fence_driver_resume(struct amdgpu_device *adev);
 int amdgpu_fence_emit(struct amdgpu_ring *ring, struct dma_fence **fence,
@@ -144,6 +173,7 @@ struct amdgpu_ring_funcs {
 
 	/* ring read/write ptr handling */
 	u64 (*get_rptr)(struct amdgpu_ring *ring);
+	u64 (*get_rreg)(struct amdgpu_ring *ring);
 	u64 (*get_wptr)(struct amdgpu_ring *ring);
 	void (*set_wptr)(struct amdgpu_ring *ring);
 	/* validating and patching of IBs */
@@ -197,6 +227,12 @@ struct amdgpu_ring_funcs {
 	void (*soft_recovery)(struct amdgpu_ring *ring, unsigned vmid);
 	int (*preempt_ib)(struct amdgpu_ring *ring);
 	void (*emit_mem_sync)(struct amdgpu_ring *ring);
+	bool (*check_ring_done)(struct amdgpu_ring *ring);
+	/* get current ring status */
+	size_t (*get_ring_status)(struct amdgpu_ring *ring, char *buf,
+				  size_t len);
+	int (*compute_mqd_init)(struct amdgpu_ring *ring);
+	int (*compute_mqd_update)(struct amdgpu_ring *ring);
 };
 
 struct amdgpu_ring {
@@ -240,10 +276,11 @@ struct amdgpu_ring {
 	volatile u32		*cond_exe_cpu_addr;
 	unsigned		vm_inv_eng;
 	struct dma_fence	*vmid_wait;
+	struct dma_fence	*tmz_queue_wait;
 	bool			has_compute_vm_bug;
 	bool			no_scheduler;
 
-	atomic_t		num_jobs[DRM_SCHED_PRIORITY_COUNT];
+	atomic_t		num_jobs;
 	struct mutex		priority_mutex;
 	/* protected by priority_mutex */
 	int			priority;
@@ -251,6 +288,39 @@ struct amdgpu_ring {
 #if defined(CONFIG_DEBUG_FS)
 	struct dentry *ent;
 #endif
+
+	bool			use_pollfence;
+	struct workqueue_struct		*wq_fence;
+	struct work_struct poll_fence_work;
+
+	bool			cwsr;
+
+	struct amdgpu_bo        *cwsr_sr_obj;
+	struct amdgpu_bo_va     *cwsr_sr_va;
+	u32                     *cwsr_sr_cpu_addr;
+
+	u64                     cwsr_sr_gpu_addr;
+	u32			cwsr_sr_size;
+	u32			cwsr_sr_ctl_size;
+
+	bool			tmz;
+	/* reused by cwsr and tmz */
+	struct amdgpu_bo_va     *ring_va;
+	struct amdgpu_bo_va     *mqd_va;
+	u64                     wptr_gpu_addr;
+	volatile u32            *wptr_cpu_addr;
+	u64                     rptr_gpu_addr;
+	volatile u32            *rptr_cpu_addr;
+	u64                     fence_gpu_addr;
+	volatile u32            *fence_cpu_addr;
+	u32                     resv_slot_idx;
+	u32			priv_vmid;
+
+	bool                    cwsr_queue_broken;
+	u64                     cwsr_tba_gpu_addr;
+	u64                     cwsr_tma_gpu_addr;
+
+	struct amdgpu_sws_ctx   sws_ctx;
 };
 
 #define amdgpu_ring_parse_cs(r, p, ib) ((r)->funcs->parse_cs((p), (ib)))
@@ -277,6 +347,8 @@ struct amdgpu_ring {
 #define amdgpu_ring_init_cond_exec(r) (r)->funcs->init_cond_exec((r))
 #define amdgpu_ring_patch_cond_exec(r,o) (r)->funcs->patch_cond_exec((r),(o))
 #define amdgpu_ring_preempt_ib(r) (r)->funcs->preempt_ib(r)
+#define amdgpu_ring_compute_mqd_init(r) (r)->funcs->compute_mqd_init(r)
+#define amdgpu_ring_compute_mqd_update(r) (r)->funcs->compute_mqd_update(r)
 
 int amdgpu_ring_alloc(struct amdgpu_ring *ring, unsigned ndw);
 void amdgpu_ring_insert_nop(struct amdgpu_ring *ring, uint32_t count);
@@ -352,5 +424,4 @@ int amdgpu_ring_test_helper(struct amdgpu_ring *ring);
 int amdgpu_debugfs_ring_init(struct amdgpu_device *adev,
 			     struct amdgpu_ring *ring);
 void amdgpu_debugfs_ring_fini(struct amdgpu_ring *ring);
-
 #endif

@@ -29,6 +29,12 @@
  *    Thomas Hellstrom <thomas-at-tungstengraphics-dot-com>
  *    Dave Airlie
  */
+
+/*
+* @file amdgpu_object.c
+* @copyright 2020 Samsung Electronics
+*/
+
 #include <linux/list.h>
 #include <linux/slab.h>
 #include <linux/dma-buf.h>
@@ -38,6 +44,7 @@
 #include "amdgpu.h"
 #include "amdgpu_trace.h"
 #include "amdgpu_amdkfd.h"
+#include <trace/events/gpu_mem.h>
 
 /**
  * DOC: amdgpu_object
@@ -153,7 +160,7 @@ void amdgpu_bo_placement_from_domain(struct amdgpu_bo *abo, u32 domain)
 		places[c].fpfn = 0;
 		places[c].lpfn = 0;
 		places[c].mem_type = TTM_PL_TT;
-		places[c].flags = 0;
+		places[c].flags = TTM_PL_FLAG_NO_EVICT;
 		if (flags & AMDGPU_GEM_CREATE_CPU_GTT_USWC)
 			places[c].flags |= TTM_PL_FLAG_WC |
 				TTM_PL_FLAG_UNCACHED;
@@ -207,7 +214,7 @@ void amdgpu_bo_placement_from_domain(struct amdgpu_bo *abo, u32 domain)
 		c++;
 	}
 
-	BUG_ON(c > AMDGPU_BO_MAX_PLACEMENTS);
+	BUG_ON(c >= AMDGPU_BO_MAX_PLACEMENTS);
 
 	placement->num_placement = c;
 	placement->placement = places;
@@ -343,8 +350,11 @@ int amdgpu_bo_create_kernel(struct amdgpu_device *adev,
 	if (r)
 		return r;
 
-	if (*bo_ptr)
+	if (*bo_ptr) {
 		amdgpu_bo_unreserve(*bo_ptr);
+		adev->num_kernel_pages += (*bo_ptr)->tbo.num_pages;
+		trace_gpu_mem_total(0, 0, adev->num_kernel_pages << PAGE_SHIFT);
+	}
 
 	return 0;
 }
@@ -408,6 +418,9 @@ int amdgpu_bo_create_kernel_at(struct amdgpu_device *adev,
 	}
 
 	amdgpu_bo_unreserve(*bo_ptr);
+
+	adev->num_kernel_pages += (*bo_ptr)->tbo.num_pages;
+	trace_gpu_mem_total(0, 0, adev->num_kernel_pages << PAGE_SHIFT);
 	return 0;
 
 error:
@@ -428,8 +441,12 @@ error:
 void amdgpu_bo_free_kernel(struct amdgpu_bo **bo, u64 *gpu_addr,
 			   void **cpu_addr)
 {
+	struct amdgpu_device *adev;
+
 	if (*bo == NULL)
 		return;
+
+	adev = amdgpu_ttm_adev((*bo)->tbo.bdev);
 
 	if (likely(amdgpu_bo_reserve(*bo, true) == 0)) {
 		if (cpu_addr)
@@ -438,6 +455,10 @@ void amdgpu_bo_free_kernel(struct amdgpu_bo **bo, u64 *gpu_addr,
 		amdgpu_bo_unpin(*bo);
 		amdgpu_bo_unreserve(*bo);
 	}
+
+	adev->num_kernel_pages -= (*bo)->tbo.num_pages;
+	trace_gpu_mem_total(0, 0, adev->num_kernel_pages << PAGE_SHIFT);
+
 	amdgpu_bo_unref(bo);
 
 	if (gpu_addr)
@@ -622,6 +643,11 @@ static int amdgpu_bo_do_create(struct amdgpu_device *adev,
 	if (bp->type == ttm_bo_type_device)
 		bo->flags &= ~AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
 
+#ifdef CONFIG_DRM_SGPU_BPMD
+	bo->bpmd_packet_id = SGPU_BPMD_LAYOUT_INVALID_PACKET_ID;
+	INIT_LIST_HEAD(&bo->bpmd_list);
+#endif	/* CONFIG_DRM_SGPU_BPMD */
+
 	return 0;
 
 fail_unreserve:
@@ -699,6 +725,79 @@ int amdgpu_bo_create(struct amdgpu_device *adev,
 		if (r)
 			amdgpu_bo_unref(bo_ptr);
 	}
+
+	return r;
+}
+
+/**
+ * amdgpu_bo_create_kernel_dmabuf - create an &amdgpu_bo buffer object from
+ *                                  kernel dma buffer
+ * @adev: amdgpu device object
+ * @bp: parameters to be used for the buffer object
+ * @bo_ptr: pointer to the buffer object pointer
+ * @vaddr: dma buffer virtual address
+ * @dma_addr: dma buffer physical address
+ * @gpu_addr: GPU address
+ *
+ * Creates an &amdgpu_bo buffer object in GTT domain from a dma buffer
+ * which is already allocated by kernel.
+ *
+ * Returns:
+ * 0 for success or a negative error code on failure.
+ */
+int amdgpu_bo_create_kernel_dmabuf(struct amdgpu_device *adev,
+				   struct amdgpu_bo_param *bp,
+				   struct amdgpu_bo **bo_ptr,
+				   void *vaddr, dma_addr_t dma_addr,
+				   u64 *gpu_addr)
+{
+	int r;
+
+	r = amdgpu_bo_do_create(adev, bp, bo_ptr);
+	if (r) {
+		dev_err(adev->dev, "(%d) failed to allocate kernel bo\n", r);
+		return r;
+	};
+
+	amdgpu_ttm_tt_set_kernelptr((*bo_ptr)->tbo.ttm,
+				    dma_addr, vaddr,
+			bp->size);
+
+	(*bo_ptr)->kmap.virtual = vaddr;
+	(*bo_ptr)->allowed_domains = AMDGPU_GEM_DOMAIN_GTT;
+	(*bo_ptr)->preferred_domains = AMDGPU_GEM_DOMAIN_GTT;
+
+	r = amdgpu_bo_reserve(*bo_ptr, false);
+	if (r) {
+		dev_err(adev->dev, "(%d) failed to reserve kernel bo\n", r);
+		goto error_free;
+	}
+
+	r = amdgpu_bo_pin(*bo_ptr, AMDGPU_GEM_DOMAIN_GTT);
+	if (r) {
+		dev_err(adev->dev, "(%d) kernel bo pin failed\n", r);
+		goto error_unreserve;
+	}
+
+	r = amdgpu_ttm_alloc_gart(&(*bo_ptr)->tbo);
+	if (r) {
+		dev_err(adev->dev, "%p bind failed\n", *bo_ptr);
+		goto error_unpin;
+	}
+
+	if (gpu_addr)
+		*gpu_addr = amdgpu_bo_gpu_offset(*bo_ptr);
+
+	return 0;
+
+error_unpin:
+	amdgpu_bo_unpin(*bo_ptr);
+
+error_unreserve:
+	amdgpu_bo_unreserve(*bo_ptr);
+
+error_free:
+	amdgpu_bo_unref(bo_ptr);
 
 	return r;
 }
@@ -904,10 +1003,6 @@ int amdgpu_bo_pin_restricted(struct amdgpu_bo *bo, u32 domain,
 
 	if (WARN_ON_ONCE(min_offset > max_offset))
 		return -EINVAL;
-
-	/* Check domain to be pinned to against preferred domains */
-	if (bo->preferred_domains & domain)
-		domain = bo->preferred_domains & domain;
 
 	/* A shared bo cannot be migrated to VRAM */
 	if (bo->prime_shared_count) {
@@ -1342,8 +1437,7 @@ void amdgpu_bo_release_notify(struct ttm_buffer_object *bo)
 	    !(abo->flags & AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE))
 		return;
 
-	if (WARN_ON_ONCE(!dma_resv_trylock(bo->base.resv)))
-		return;
+	dma_resv_lock(bo->base.resv, NULL);
 
 	r = amdgpu_fill_buffer(abo, AMDGPU_POISON, bo->base.resv, &fence);
 	if (!WARN_ON(r)) {
@@ -1531,6 +1625,9 @@ u64 amdgpu_bo_gpu_offset_no_check(struct amdgpu_bo *bo)
 uint32_t amdgpu_bo_get_preferred_pin_domain(struct amdgpu_device *adev,
 					    uint32_t domain)
 {
+	if (amdgpu_force_gtt && (domain & AMDGPU_GEM_DOMAIN_VRAM))
+		return AMDGPU_GEM_DOMAIN_GTT;
+
 	if (domain == (AMDGPU_GEM_DOMAIN_VRAM | AMDGPU_GEM_DOMAIN_GTT)) {
 		domain = AMDGPU_GEM_DOMAIN_VRAM;
 		if (adev->gmc.real_vram_size <= AMDGPU_SG_THRESHOLD)

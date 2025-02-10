@@ -1,5 +1,5 @@
 /*
- * Copyright 2016 Advanced Micro Devices, Inc.
+ * Copyright 2016, 2020 Advanced Micro Devices, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -143,7 +143,7 @@ static const struct soc15_reg_golden golden_settings_sdma_4_1[] = {
 	SOC15_REG_GOLDEN_VALUE(SDMA0, 0, mmSDMA0_RLC0_RB_WPTR_POLL_CNTL, 0xfffffff7, 0x00403000),
 	SOC15_REG_GOLDEN_VALUE(SDMA0, 0, mmSDMA0_RLC1_IB_CNTL, 0x800f0111, 0x00000100),
 	SOC15_REG_GOLDEN_VALUE(SDMA0, 0, mmSDMA0_RLC1_RB_WPTR_POLL_CNTL, 0xfffffff7, 0x00403000),
-	SOC15_REG_GOLDEN_VALUE(SDMA0, 0, mmSDMA0_UTCL1_PAGE, 0x000003ff, 0x000003e0),
+	SOC15_REG_GOLDEN_VALUE(SDMA0, 0, mmSDMA0_UTCL1_PAGE, 0x000003ff, 0x000003c0),
 	SOC15_REG_GOLDEN_VALUE(SDMA0, 0, mmSDMA0_UTCL1_WATERMK, 0xfc000000, 0x00000000)
 };
 
@@ -269,7 +269,7 @@ static const struct soc15_reg_golden golden_settings_sdma_4_3[] = {
 	SOC15_REG_GOLDEN_VALUE(SDMA0, 0, mmSDMA0_POWER_CNTL, 0x003fff07, 0x40000051),
 	SOC15_REG_GOLDEN_VALUE(SDMA0, 0, mmSDMA0_RLC0_RB_WPTR_POLL_CNTL, 0xfffffff7, 0x00403000),
 	SOC15_REG_GOLDEN_VALUE(SDMA0, 0, mmSDMA0_RLC1_RB_WPTR_POLL_CNTL, 0xfffffff7, 0x00403000),
-	SOC15_REG_GOLDEN_VALUE(SDMA0, 0, mmSDMA0_UTCL1_PAGE, 0x000003ff, 0x000003e0),
+	SOC15_REG_GOLDEN_VALUE(SDMA0, 0, mmSDMA0_UTCL1_PAGE, 0x000003ff, 0x000003c0),
 	SOC15_REG_GOLDEN_VALUE(SDMA0, 0, mmSDMA0_UTCL1_WATERMK, 0xfc000000, 0x03fbe1fe)
 };
 
@@ -1798,6 +1798,132 @@ static void sdma_v4_0_ring_emit_reg_wait(struct amdgpu_ring *ring, uint32_t reg,
 	sdma_v4_0_wait_reg_mem(ring, 0, 0, reg, 0, val, mask, 10);
 }
 
+#if defined(CONFIG_DRM_AMDGPU_SDMA_DUMP)
+static size_t sdma_v4_0_ring_get_ring_status_sdma(struct amdgpu_ring *ring,
+						  char *buf,
+						  size_t len)
+{
+	unsigned int i;
+	bool is_f32_halted, is_ring_enabled, is_idle;
+	u32 temp32, reg_f32_cntl, reg_rb_cntl, reg_ib_cntl;
+	u64 temp64;
+	struct amdgpu_device *adev = ring->adev;
+	u32 last_seq = atomic_read(&ring->fence_drv.last_seq);
+	u32 job_pending = ring->fence_drv.sync_seq - last_seq;
+	size_t size;
+
+	reg_f32_cntl = RREG32_SDMA(ring->me, mmSDMA0_F32_CNTL);
+	is_f32_halted = reg_f32_cntl & SDMA0_F32_CNTL__HALT_MASK;
+
+	reg_rb_cntl = RREG32_SDMA(ring->me, mmSDMA0_GFX_RB_CNTL);
+
+	reg_ib_cntl = RREG32_SDMA(ring->me, mmSDMA0_GFX_IB_CNTL);
+	is_ring_enabled = (reg_rb_cntl &
+			   SDMA0_GFX_RB_CNTL__RB_ENABLE_MASK) &&
+			  (reg_ib_cntl &
+			   SDMA0_GFX_IB_CNTL__IB_ENABLE_MASK);
+
+	temp32 = RREG32_SDMA(ring->me, mmSDMA0_STATUS_REG);
+	is_idle = temp32 & SDMA0_STATUS_REG__IDLE_MASK;
+
+	size = snprintf(buf, len,
+			"Ring(%s): f32(%s), ring(%s), status(%s), job_pending(%u)\n",
+			ring->name, (is_f32_halted ? "HALTED" : "READY"),
+			(is_ring_enabled ? "ENABLED" : "DISABLE"),
+			(is_idle ? "IDLE" : "BUSY"), job_pending);
+
+	if (!is_idle || job_pending) {
+		size += snprintf(buf + size, len - size,
+				 "  SDMA%d_STATUS_REG  = 0x%08x\n",
+				 ring->me, temp32);
+		size += snprintf(buf + size, len - size,
+				 "    INSIDE_IB(%lu)\n",
+				 ((temp32 &
+				   SDMA0_STATUS_REG__INSIDE_IB_MASK) >>
+				  SDMA0_STATUS_REG__INSIDE_IB__SHIFT));
+
+		temp32 = RREG32_SDMA(ring->me, mmSDMA0_STATUS1_REG);
+		size += snprintf(buf + size, len - size,
+				 "  SDMA%d_STATUS1_REG = 0x%08x\n",
+				 ring->me, temp32);
+
+		temp32 = RREG32_SDMA(ring->me, mmSDMA0_STATUS2_REG);
+		size += snprintf(buf + size, len - size,
+				 "  SDMA%d_STATUS2_REG = 0x%08x\n",
+				 ring->me, temp32);
+		size += snprintf(buf + size, len - size,
+				 "    CMD_OP(0x%04lx)\n",
+				 ((temp32 &
+				   SDMA0_STATUS2_REG__CMD_OP_MASK) >>
+				  SDMA0_STATUS2_REG__CMD_OP__SHIFT));
+
+		temp32 = RREG32_SDMA(ring->me, mmSDMA0_STATUS3_REG);
+		size += snprintf(buf + size, len - size,
+				 "  SDMA%d_STATUS3_REG = 0x%08x\n",
+				 ring->me, temp32);
+
+		temp64 = ((u64)RREG32_SDMA(ring->me, mmSDMA0_GFX_RB_BASE_HI) &
+			  SDMA0_GFX_RB_BASE_HI__ADDR_MASK) << 32;
+		temp64 |= RREG32_SDMA(ring->me, mmSDMA0_GFX_RB_BASE);
+		size += snprintf(buf + size, len - size,
+				 "  GPUAddress(sw,hw): (0x%016llx,0x%016llx)\n",
+				 ring->gpu_addr, temp64 << 8);
+
+		temp32 = ((reg_rb_cntl & SDMA0_GFX_RB_CNTL__RB_SIZE_MASK) >>
+			  SDMA0_GFX_RB_CNTL__RB_SIZE__SHIFT);
+		temp32 = (1 << (temp32 + 2));
+		size += snprintf(buf + size, len - size,
+				 "  RB Size: (0x%08x == 0x%08x)\n",
+				 ring->ring_size, temp32);
+
+		temp32 = RREG32_SDMA(ring->me, mmSDMA0_GFX_RB_RPTR) &
+				SDMA0_GFX_RB_RPTR__OFFSET_MASK;
+		size += snprintf(buf + size, len - size,
+				 "  RPTR = 0x%08x\n", (temp32 >> 2));
+
+		temp64 = (u64)RREG32_SDMA(ring->me, mmSDMA0_GFX_RB_WPTR_HI)
+			 << 32;
+		temp64 |= RREG32_SDMA(ring->me, mmSDMA0_GFX_RB_WPTR);
+		size += snprintf(buf + size, len - size,
+				 "  WPTR: (0x%016llx == 0x%016llx)\n",
+				 ring->wptr, (temp64 >> 2));
+
+		temp64 = (u64)RREG32_SDMA(ring->me, mmSDMA0_GFX_IB_BASE_HI)
+			<< 32;
+		temp64 |= RREG32_SDMA(ring->me, mmSDMA0_GFX_IB_BASE_LO);
+		size += snprintf(buf + size, len - size,
+				 "  IB GPUAddress = 0x%016llx\n", temp64);
+
+		temp32 = RREG32_SDMA(ring->me, mmSDMA0_GFX_IB_RPTR) &
+			 SDMA0_GFX_IB_RPTR__OFFSET_MASK;
+		size += snprintf(buf + size, len - size,
+				 "  IB RPTR = 0x%08x\n", temp32);
+
+		temp32 = RREG32_SDMA(ring->me, mmSDMA0_GFX_IB_SUB_REMAIN) &
+			 SDMA0_GFX_IB_SUB_REMAIN__SIZE_MASK;
+		size += snprintf(buf + size, len - size,
+				 "  IB remain size = 0x%08x\n", temp32);
+
+		size += snprintf(buf + size, len - size,
+				 "  Ring running frame:\n");
+		temp64 = ring->wptr - (job_pending *
+				(ring->funcs->align_mask + 1));
+		for (i = 0; i < ring->funcs->align_mask + 1; i++) {
+			temp32 = ring->ring[temp64 & ring->buf_mask];
+			size += snprintf(buf + size, len - size,
+					 "    [0x%016llx]=0x%08x\n",
+					 temp64, temp32);
+			temp64++;
+		}
+
+		size += snprintf(buf + size, len - size,
+				 "  Current IB:  TODO\n");
+	}
+
+	return size;
+}
+#endif /* CONFIG_DRM_AMDGPU_SDMA_DUMP */
+
 static bool sdma_v4_0_fw_support_paging_queue(struct amdgpu_device *adev)
 {
 	uint fw_version = adev->sdma.instance[0].fw_version;
@@ -1979,11 +2105,9 @@ static int sdma_v4_0_hw_fini(void *handle)
 	if (amdgpu_sriov_vf(adev))
 		return 0;
 
-	if (amdgpu_ras_is_supported(adev, AMDGPU_RAS_BLOCK__SDMA)) {
-		for (i = 0; i < adev->sdma.num_instances; i++) {
-			amdgpu_irq_put(adev, &adev->sdma.ecc_irq,
-				       AMDGPU_SDMA_IRQ_INSTANCE0 + i);
-		}
+	for (i = 0; i < adev->sdma.num_instances; i++) {
+		amdgpu_irq_put(adev, &adev->sdma.ecc_irq,
+			       AMDGPU_SDMA_IRQ_INSTANCE0 + i);
 	}
 
 	sdma_v4_0_ctx_switch_enable(adev, false);
@@ -2326,6 +2450,9 @@ static const struct amdgpu_ring_funcs sdma_v4_0_ring_funcs = {
 	.emit_wreg = sdma_v4_0_ring_emit_wreg,
 	.emit_reg_wait = sdma_v4_0_ring_emit_reg_wait,
 	.emit_reg_write_reg_wait = amdgpu_ring_emit_reg_write_reg_wait_helper,
+#if defined(CONFIG_DRM_AMDGPU_SDMA_DUMP)
+	.get_ring_status = sdma_v4_0_ring_get_ring_status_sdma,
+#endif
 };
 
 /*
@@ -2394,6 +2521,9 @@ static const struct amdgpu_ring_funcs sdma_v4_0_page_ring_funcs = {
 	.emit_wreg = sdma_v4_0_ring_emit_wreg,
 	.emit_reg_wait = sdma_v4_0_ring_emit_reg_wait,
 	.emit_reg_write_reg_wait = amdgpu_ring_emit_reg_write_reg_wait_helper,
+#if defined(CONFIG_DRM_AMDGPU_SDMA_DUMP)
+	.get_ring_status = sdma_v4_0_ring_get_ring_status_sdma,
+#endif
 };
 
 static const struct amdgpu_ring_funcs sdma_v4_0_page_ring_funcs_2nd_mmhub = {

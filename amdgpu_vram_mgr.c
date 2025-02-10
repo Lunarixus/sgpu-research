@@ -562,6 +562,9 @@ uint64_t amdgpu_vram_mgr_usage(struct ttm_resource_manager *man)
 {
 	struct amdgpu_vram_mgr *mgr = to_vram_mgr(man);
 
+	if (amdgpu_force_gtt)
+		return 0;
+
 	return atomic64_read(&mgr->usage);
 }
 
@@ -575,6 +578,9 @@ uint64_t amdgpu_vram_mgr_usage(struct ttm_resource_manager *man)
 uint64_t amdgpu_vram_mgr_vis_usage(struct ttm_resource_manager *man)
 {
 	struct amdgpu_vram_mgr *mgr = to_vram_mgr(man);
+
+	if (amdgpu_force_gtt)
+		return 0;
 
 	return atomic64_read(&mgr->vis_usage);
 }

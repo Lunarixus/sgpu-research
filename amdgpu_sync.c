@@ -274,6 +274,23 @@ int amdgpu_sync_resv(struct amdgpu_device *adev, struct amdgpu_sync *sync,
 	return r;
 }
 
+void sgpu_sync_trace_fence(struct amdgpu_sync *sync)
+{
+	struct amdgpu_sync_entry *e;
+	struct hlist_node *tmp;
+	struct dma_fence *f;
+	struct amdgpu_job *job =
+		container_of(sync, struct amdgpu_job, sync);
+	int i;
+
+	hash_for_each_safe(sync->fences, i, tmp, e, node) {
+		f = e->fence;
+		if (!f)
+			continue;
+		trace_sgpu_job_dependency(&job->base, f);
+	}
+
+}
 /**
  * amdgpu_sync_peek_fence - get the next fence not signaled yet
  *
@@ -446,4 +463,81 @@ int amdgpu_sync_init(void)
 void amdgpu_sync_fini(void)
 {
 	kmem_cache_destroy(amdgpu_sync_slab);
+}
+
+#define EXTERNAL_TIMEOUT (1 * HZ)
+static bool sgpu_sync_external_fence_check(struct amdgpu_sync *sync)
+{
+	struct amdgpu_sync_entry *e;
+	struct hlist_node *tmp;
+	struct dma_fence *f;
+	int i = 0;
+
+	hash_for_each_safe(sync->fences, i, tmp, e, node) {
+		f = e->fence;
+
+		if (dma_fence_is_signaled(f))
+			continue;
+
+		/* Only external fence */
+		if ((!strcmp(f->ops->get_driver_name(f), "amdgpu")) &&
+		    (!strcmp(f->ops->get_driver_name(f), "drm_sched")))
+			return true;
+	}
+
+	return false;
+}
+
+static void sgpu_sync_log_unscheduled_job(struct work_struct *work)
+{
+	struct amdgpu_job *job;
+	struct dma_fence *fence = NULL;
+	struct amdgpu_sync_entry *e;
+	struct hlist_node *tmp;
+	struct dma_fence *f;
+	signed long remaining = 0;
+	const signed long timeout = EXTERNAL_TIMEOUT;
+	int i = 0;
+
+	job = container_of(work, struct amdgpu_job, wait_on_scheduled_work);
+	fence = &job->base.s_fence->scheduled;
+
+	remaining = dma_fence_wait_timeout(fence, true, timeout);
+	dma_fence_put(fence);
+
+	if (remaining)
+		return;
+
+	DRM_INFO("%s: current job finished context=%d seqno=%d\n",
+	       to_amdgpu_ring(job->base.sched)->name,
+	       job->base.s_fence->finished.context,
+	       job->base.s_fence->finished.seqno);
+	hash_for_each_safe(job->sync.fences, i, tmp, e, node) {
+		f = e->fence;
+		if (!f)
+			continue;
+		DRM_INFO("%s: driver=%s timeline=%s context=%llu seqno=%llu %s",
+			 to_amdgpu_ring(job->base.sched)->name,
+			 f->ops->get_driver_name(f),
+			 f->ops->get_timeline_name(f),
+			 f->context, f->seqno,
+			 dma_fence_is_signaled(f) ? "SIGNALED" : "UNSIGNALED");
+	}
+
+	return;
+}
+
+int sgpu_sync_external_fence_tracker(struct amdgpu_job *job)
+{
+	struct work_struct *work = &job->wait_on_scheduled_work;
+	int ret = 0;
+
+	INIT_WORK(work, sgpu_sync_log_unscheduled_job);
+	if(!sgpu_sync_external_fence_check(&job->sync))
+		return ret;
+
+	dma_fence_get(&job->base.s_fence->scheduled);
+	ret = schedule_work(work);
+
+	return ret;
 }

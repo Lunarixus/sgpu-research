@@ -39,6 +39,7 @@ struct amdgpu_ih_ring {
 	u32			doorbell_index;
 	bool			use_doorbell;
 	bool			use_bus_addr;
+	bool			use_write_back;
 
 	struct amdgpu_bo	*ring_obj;
 	volatile uint32_t	*ring;
@@ -52,6 +53,7 @@ struct amdgpu_ih_ring {
 
 	bool                    enabled;
 	unsigned		rptr;
+	atomic_t		last_rptr;
 	atomic_t		lock;
 };
 

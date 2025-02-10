@@ -46,3 +46,6 @@ int amdgpu_debugfs_fence_init(struct amdgpu_device *adev);
 int amdgpu_debugfs_firmware_init(struct amdgpu_device *adev);
 int amdgpu_debugfs_gem_init(struct amdgpu_device *adev);
 int amdgpu_debugfs_wait_dump(struct amdgpu_device *adev);
+int sgpu_debugfs_bpmd_init(struct amdgpu_device *sdev);
+void sgpu_debugfs_bpmd_cleanup(struct amdgpu_device *sdev);
+int sgpu_debugfs_jobtimeout_to_panic_init(struct amdgpu_device *adev);

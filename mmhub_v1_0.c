@@ -178,7 +178,6 @@ static void mmhub_v1_0_init_cache_regs(struct amdgpu_device *adev)
 	tmp = REG_SET_FIELD(tmp, VM_L2_CNTL2, INVALIDATE_L2_CACHE, 1);
 	WREG32_SOC15(MMHUB, 0, mmVM_L2_CNTL2, tmp);
 
-	tmp = mmVM_L2_CNTL3_DEFAULT;
 	if (adev->gmc.translate_further) {
 		tmp = REG_SET_FIELD(tmp, VM_L2_CNTL3, BANK_SELECT, 12);
 		tmp = REG_SET_FIELD(tmp, VM_L2_CNTL3,
@@ -437,13 +436,16 @@ static void mmhub_v1_0_init(struct amdgpu_device *adev)
 		SOC15_REG_OFFSET(MMHUB, 0, mmVM_L2_PROTECTION_FAULT_STATUS);
 	hub->vm_l2_pro_fault_cntl =
 		SOC15_REG_OFFSET(MMHUB, 0, mmVM_L2_PROTECTION_FAULT_CNTL);
-
 	hub->ctx_distance = mmVM_CONTEXT1_CNTL - mmVM_CONTEXT0_CNTL;
 	hub->ctx_addr_distance = mmVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32 -
 		mmVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32;
 	hub->eng_distance = mmVM_INVALIDATE_ENG1_REQ - mmVM_INVALIDATE_ENG0_REQ;
 	hub->eng_addr_distance = mmVM_INVALIDATE_ENG1_ADDR_RANGE_LO32 -
 		mmVM_INVALIDATE_ENG0_ADDR_RANGE_LO32;
+	hub->vm_l2_pro_fault_addr_lo32 =
+		SOC15_REG_OFFSET(MMHUB, 0, mmVM_L2_PROTECTION_FAULT_ADDR_LO32);
+	hub->vm_l2_pro_fault_addr_hi32 =
+		SOC15_REG_OFFSET(MMHUB, 0, mmVM_L2_PROTECTION_FAULT_ADDR_HI32);
 }
 
 static void mmhub_v1_0_update_medium_grain_clock_gating(struct amdgpu_device *adev,

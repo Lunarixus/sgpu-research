@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Advanced Micro Devices, Inc.
+ * Copyright 2019 - 2020 Advanced Micro Devices, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -163,6 +163,9 @@ static void mmhub_v2_0_setup_vm_pt_regs(struct amdgpu_device *adev, uint32_t vmi
 				uint64_t page_table_base)
 {
 	struct amdgpu_vmhub *hub = &adev->vmhub[AMDGPU_MMHUB_0];
+
+	if (adev->asic_type == CHIP_VANGOGH_LITE)
+		return;
 
 	WREG32_SOC15_OFFSET(MMHUB, 0, mmMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32,
 			    hub->ctx_addr_distance * vmid,
@@ -400,6 +403,9 @@ static void mmhub_v2_0_program_invalidation(struct amdgpu_device *adev)
 
 static int mmhub_v2_0_gart_enable(struct amdgpu_device *adev)
 {
+	if (adev->asic_type == CHIP_VANGOGH_LITE)
+		return 0;
+
 	/* GART Enable. */
 	mmhub_v2_0_init_gart_aperture_regs(adev);
 	mmhub_v2_0_init_system_aperture_regs(adev);
@@ -419,6 +425,9 @@ static void mmhub_v2_0_gart_disable(struct amdgpu_device *adev)
 	struct amdgpu_vmhub *hub = &adev->vmhub[AMDGPU_MMHUB_0];
 	u32 tmp;
 	u32 i;
+
+	if (adev->asic_type == CHIP_VANGOGH_LITE)
+		return;
 
 	/* Disable all tables */
 	for (i = 0; i < 16; i++)
@@ -448,6 +457,9 @@ static void mmhub_v2_0_gart_disable(struct amdgpu_device *adev)
 static void mmhub_v2_0_set_fault_enable_default(struct amdgpu_device *adev, bool value)
 {
 	u32 tmp;
+
+	if (adev->asic_type == CHIP_VANGOGH_LITE)
+		return;
 
 	/* These registers are not accessible to VF-SRIOV.
 	 * The PF will program them instead.
@@ -497,6 +509,9 @@ static void mmhub_v2_0_init(struct amdgpu_device *adev)
 {
 	struct amdgpu_vmhub *hub = &adev->vmhub[AMDGPU_MMHUB_0];
 
+	if (adev->asic_type == CHIP_VANGOGH_LITE)
+		return;
+
 	hub->ctx0_ptb_addr_lo32 =
 		SOC15_REG_OFFSET(MMHUB, 0,
 				 mmMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32);
@@ -515,7 +530,6 @@ static void mmhub_v2_0_init(struct amdgpu_device *adev)
 		SOC15_REG_OFFSET(MMHUB, 0, mmMMVM_L2_PROTECTION_FAULT_STATUS);
 	hub->vm_l2_pro_fault_cntl =
 		SOC15_REG_OFFSET(MMHUB, 0, mmMMVM_L2_PROTECTION_FAULT_CNTL);
-
 	hub->ctx_distance = mmMMVM_CONTEXT1_CNTL - mmMMVM_CONTEXT0_CNTL;
 	hub->ctx_addr_distance = mmMMVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32 -
 		mmMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32;
@@ -533,6 +547,13 @@ static void mmhub_v2_0_init(struct amdgpu_device *adev)
 		MMVM_CONTEXT1_CNTL__EXECUTE_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK;
 
 	hub->vmhub_funcs = &mmhub_v2_0_vmhub_funcs;
+
+	hub->vm_l2_pro_fault_addr_lo32 =
+		SOC15_REG_OFFSET(MMHUB, 0,
+				 mmMMVM_L2_PROTECTION_FAULT_ADDR_LO32);
+	hub->vm_l2_pro_fault_addr_hi32 =
+		SOC15_REG_OFFSET(MMHUB, 0,
+				 mmMMVM_L2_PROTECTION_FAULT_ADDR_HI32);
 }
 
 static void mmhub_v2_0_update_medium_grain_clock_gating(struct amdgpu_device *adev,
@@ -626,6 +647,9 @@ static void mmhub_v2_0_update_medium_grain_light_sleep(struct amdgpu_device *ade
 static int mmhub_v2_0_set_clockgating(struct amdgpu_device *adev,
 			       enum amd_clockgating_state state)
 {
+	if (adev->asic_type == CHIP_VANGOGH_LITE)
+		return 0;
+
 	if (amdgpu_sriov_vf(adev))
 		return 0;
 
@@ -650,6 +674,9 @@ static int mmhub_v2_0_set_clockgating(struct amdgpu_device *adev,
 static void mmhub_v2_0_get_clockgating(struct amdgpu_device *adev, u32 *flags)
 {
 	int data, data1;
+
+	if (adev->asic_type == CHIP_VANGOGH_LITE)
+		return;
 
 	if (amdgpu_sriov_vf(adev))
 		*flags = 0;

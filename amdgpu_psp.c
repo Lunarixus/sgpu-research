@@ -222,7 +222,7 @@ int psp_wait_for(struct psp_context *psp, uint32_t reg_index,
 	int i;
 	struct amdgpu_device *adev = psp->adev;
 
-	if (psp->adev->in_pci_err_recovery)
+	if (sgpu_no_hw_access)
 		return 0;
 
 	for (i = 0; i < adev->usec_timeout; i++) {
@@ -251,7 +251,7 @@ psp_cmd_submit_buf(struct psp_context *psp,
 	bool ras_intr = false;
 	bool skip_unsupport = false;
 
-	if (psp->adev->in_pci_err_recovery)
+	if (sgpu_no_hw_access)
 		return 0;
 
 	mutex_lock(&psp->mutex);
@@ -1921,7 +1921,7 @@ static int psp_load_smu_fw(struct psp_context *psp)
 static bool fw_load_skip_check(struct psp_context *psp,
 			       struct amdgpu_firmware_info *ucode)
 {
-	if (!ucode->fw || !ucode->ucode_size)
+	if (!ucode->fw)
 		return true;
 
 	if (ucode->ucode_id == AMDGPU_UCODE_ID_SMC &&
@@ -2146,9 +2146,6 @@ static int psp_hw_fini(void *handle)
 		psp_rap_terminate(psp);
 		psp_dtm_terminate(psp);
 		psp_hdcp_terminate(psp);
-
-		if (adev->gmc.xgmi.num_physical_nodes > 1)
-			psp_xgmi_terminate(psp);
 	}
 
 	psp_asd_unload(psp);

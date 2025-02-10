@@ -142,6 +142,9 @@ static void dce_virtual_crtc_dpms(struct drm_crtc *crtc, int mode)
 	if (amdgpu_sriov_vf(adev))
 		return;
 
+	if (adev->asic_type == CHIP_VANGOGH_LITE)
+		return;
+
 	switch (mode) {
 	case DRM_MODE_DPMS_ON:
 		amdgpu_crtc->enabled = true;
@@ -473,6 +476,10 @@ static int dce_virtual_hw_init(void *handle)
 #endif
 		/* no DCE */
 		break;
+
+	case CHIP_VANGOGH_LITE:
+		break;
+
 	default:
 		break;
 	}

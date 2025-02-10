@@ -1,5 +1,5 @@
 /*
- * Copyright 2016 Advanced Micro Devices, Inc.
+ * Copyright 2016, 2020 Advanced Micro Devices, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -246,8 +246,6 @@ static u32 soc15_get_xclk(struct amdgpu_device *adev)
 {
 	u32 reference_clock = adev->clock.spll.reference_freq;
 
-	if (adev->asic_type == CHIP_RENOIR)
-		return 10000;
 	if (adev->asic_type == CHIP_RAVEN)
 		return reference_clock / 4;
 
@@ -382,9 +380,8 @@ static int soc15_read_register(struct amdgpu_device *adev, u32 se_num,
 	*value = 0;
 	for (i = 0; i < ARRAY_SIZE(soc15_allowed_read_registers); i++) {
 		en = &soc15_allowed_read_registers[i];
-		if (!adev->reg_offset[en->hwip][en->inst])
-			continue;
-		else if (reg_offset != (adev->reg_offset[en->hwip][en->inst][en->seg]
+		if (adev->reg_offset[en->hwip][en->inst] &&
+			reg_offset != (adev->reg_offset[en->hwip][en->inst][en->seg]
 					+ en->reg_offset))
 			continue;
 
@@ -1002,6 +999,35 @@ static void soc15_pre_asic_init(struct amdgpu_device *adev)
 	gmc_v9_0_restore_registers(adev);
 }
 
+#if defined(CONFIG_DRM_AMDGPU_DUMP)
+static size_t soc15_get_asic_status(struct amdgpu_device *adev,
+				    char *buf, size_t len)
+{
+	size_t size;
+	unsigned int i;
+	struct amdgpu_ring *ring;
+
+	size = snprintf(buf, len,
+			"******DUMP GPU STATUS START******\n");
+
+	if (adev->gmc.gmc_funcs->get_gmc_status)
+		size += adev->gmc.gmc_funcs->get_gmc_status(adev, buf + size,
+							    len - size);
+
+	for (i = 0; i < adev->num_rings; ++i) {
+		ring = adev->rings[i];
+		if (ring->funcs->get_ring_status)
+			size += ring->funcs->get_ring_status(ring, buf + size,
+							     len - size);
+	}
+
+	size += snprintf(buf + size, len - size,
+			 "******DUMP GPU STATUS_END******\n");
+
+	return size;
+}
+#endif /* CONFIG_DRM_AMDGPU_DUMP */
+
 static const struct amdgpu_asic_funcs soc15_asic_funcs =
 {
 	.read_disabled_bios = &soc15_read_disabled_bios,
@@ -1023,6 +1049,9 @@ static const struct amdgpu_asic_funcs soc15_asic_funcs =
 	.get_pcie_replay_count = &soc15_get_pcie_replay_count,
 	.supports_baco = &soc15_supports_baco,
 	.pre_asic_init = &soc15_pre_asic_init,
+#if defined(CONFIG_DRM_AMDGPU_DUMP)
+	.get_asic_status = &soc15_get_asic_status,
+#endif
 };
 
 static const struct amdgpu_asic_funcs vega20_asic_funcs =
@@ -1184,6 +1213,7 @@ static int soc15_common_early_init(void *handle)
 			adev->cg_flags = AMD_CG_SUPPORT_GFX_MGCG |
 				AMD_CG_SUPPORT_GFX_MGLS |
 				AMD_CG_SUPPORT_GFX_CP_LS |
+				AMD_CG_SUPPORT_GFX_3D_CGCG |
 				AMD_CG_SUPPORT_GFX_3D_CGLS |
 				AMD_CG_SUPPORT_GFX_CGCG |
 				AMD_CG_SUPPORT_GFX_CGLS |
@@ -1195,17 +1225,15 @@ static int soc15_common_early_init(void *handle)
 				AMD_CG_SUPPORT_SDMA_MGCG |
 				AMD_CG_SUPPORT_SDMA_LS;
 
-			/*
-			 * MMHUB PG needs to be disabled for Picasso for
-			 * stability reasons.
-			 */
 			adev->pg_flags = AMD_PG_SUPPORT_SDMA |
+				AMD_PG_SUPPORT_MMHUB |
 				AMD_PG_SUPPORT_VCN;
 		} else {
 			adev->cg_flags = AMD_CG_SUPPORT_GFX_MGCG |
 				AMD_CG_SUPPORT_GFX_MGLS |
 				AMD_CG_SUPPORT_GFX_RLC_LS |
 				AMD_CG_SUPPORT_GFX_CP_LS |
+				AMD_CG_SUPPORT_GFX_3D_CGCG |
 				AMD_CG_SUPPORT_GFX_3D_CGLS |
 				AMD_CG_SUPPORT_GFX_CGCG |
 				AMD_CG_SUPPORT_GFX_CGLS |

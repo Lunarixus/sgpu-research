@@ -3428,7 +3428,7 @@ static void gfx_v8_0_tiling_mode_table_init(struct amdgpu_device *adev)
 	}
 }
 
-static void gfx_v8_0_select_se_sh(struct amdgpu_device *adev,
+static u32 gfx_v8_0_select_se_sh(struct amdgpu_device *adev,
 				  u32 se_num, u32 sh_num, u32 instance)
 {
 	u32 data;
@@ -3449,6 +3449,8 @@ static void gfx_v8_0_select_se_sh(struct amdgpu_device *adev,
 		data = REG_SET_FIELD(data, GRBM_GFX_INDEX, SH_INDEX, sh_num);
 
 	WREG32(mmGRBM_GFX_INDEX, data);
+
+	return data;
 }
 
 static void gfx_v8_0_select_me_pipe_q(struct amdgpu_device *adev,

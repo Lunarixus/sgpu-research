@@ -37,13 +37,14 @@
 #include "amdgpu.h"
 #include "amdgpu_display.h"
 #include "amdgpu_xgmi.h"
+#include <trace/events/gpu_mem.h>
+extern struct amdgpu_device *p_adev;
 
 void amdgpu_gem_object_free(struct drm_gem_object *gobj)
 {
 	struct amdgpu_bo *robj = gem_to_amdgpu_bo(gobj);
 
 	if (robj) {
-		amdgpu_mn_unregister(robj);
 		amdgpu_bo_unref(&robj);
 	}
 }
@@ -67,10 +68,23 @@ int amdgpu_gem_object_create(struct amdgpu_device *adev, unsigned long size,
 	bp.resv = resv;
 	bp.preferred_domain = initial_domain;
 	bp.flags = flags;
-	bp.domain = initial_domain;
+	if (amdgpu_force_gtt && (initial_domain & AMDGPU_GEM_DOMAIN_VRAM))
+		bp.domain = AMDGPU_GEM_DOMAIN_GTT;
+	else
+		bp.domain = initial_domain;
 	r = amdgpu_bo_create(adev, &bp, &bo);
 	if (r)
 		return r;
+
+	if (bo && bo->tbo.ttm && bo->tbo.ttm->pages &&
+	    !(bo->tbo.ttm->page_flags & TTM_PAGE_FLAG_SG)) {
+		struct ttm_dma_tt *ttm = (void *)bo->tbo.ttm;
+		SGPU_LOG(adev, DMSG_INFO, DMSG_MEMORY,
+			 "bo=0x%08x, size=0x%08x, num_pages=%4lu, page_flags=0x%08x, "
+			 "page[0]=0x%016x, dma_address=0x%016x",
+			 bo, bo->tbo.base.size, ttm->ttm.num_pages,
+			 ttm->ttm.page_flags, ttm->ttm.pages[0], ttm->dma_address);
+	}
 
 	*obj = &bo->tbo.base;
 
@@ -163,6 +177,29 @@ void amdgpu_gem_object_close(struct drm_gem_object *obj,
 
 	amdgpu_vm_get_pd_bo(vm, &list, &vm_pd);
 
+	if ((current->flags & PF_EXITING) && (current->exit_code == SIGKILL)){
+		struct ttm_validate_buffer *entry;
+
+		list_for_each_entry(entry, &list, head) {
+			struct ttm_buffer_object *bo = entry->bo;
+			int try_cnt = 3;
+
+			while(try_cnt){
+				r = ttm_bo_reserve(bo, false, true, NULL);
+				if (r){
+					try_cnt--;
+					continue;
+				}
+				break;
+			}
+			if (r)
+				dev_err(adev->dev,
+					"bo reserve failed bo: %lx(%d), ret:%d\n try to force unreserve\n",
+					bo, bo->num_pages, r);
+			ttm_bo_unreserve(bo);
+		}
+	}
+
 	r = ttm_eu_reserve_buffers(&ticket, &list, false, &duplicates);
 	if (r) {
 		dev_err(adev->dev, "leaking bo va because "
@@ -172,6 +209,19 @@ void amdgpu_gem_object_close(struct drm_gem_object *obj,
 	bo_va = amdgpu_vm_bo_find(vm, bo);
 	if (!bo_va || --bo_va->ref_count)
 		goto out_unlock;
+
+	if (!amdgpu_ttm_tt_is_userptr(bo->tbo.ttm))
+		amdgpu_gem_bo_size(obj, file_priv, SUB_BO_SIZE);
+
+	if (bo && bo->tbo.ttm && bo->tbo.ttm->pages &&
+	    !(bo->tbo.ttm->page_flags & TTM_PAGE_FLAG_SG)) {
+		struct ttm_dma_tt *ttm = (void *)bo->tbo.ttm;
+		SGPU_LOG(adev, DMSG_INFO, DMSG_MEMORY,
+			 "bo=0x%08x, size=0x%08x, num_pages=%4lu, page_flags=0x%08x, "
+			 "page[0]=0x%016x, dma_address=0x%016x",
+			 bo, bo->tbo.base.size, ttm->ttm.num_pages,
+			 ttm->ttm.page_flags, ttm->ttm.pages[0], ttm->dma_address);
+	}
 
 	amdgpu_vm_bo_rmv(adev, bo_va);
 	if (!amdgpu_vm_ready(vm))
@@ -191,7 +241,7 @@ void amdgpu_gem_object_close(struct drm_gem_object *obj,
 	dma_fence_put(fence);
 
 out_unlock:
-	if (unlikely(r < 0))
+	if (unlikely(r < 0) && r != -ERESTARTSYS)
 		dev_err(adev->dev, "failed to clear page "
 			"tables on GEM object close (%ld)\n", r);
 	ttm_eu_backoff_reservation(&ticket, &list);
@@ -221,7 +271,8 @@ int amdgpu_gem_create_ioctl(struct drm_device *dev, void *data,
 		      AMDGPU_GEM_CREATE_VRAM_CLEARED |
 		      AMDGPU_GEM_CREATE_VM_ALWAYS_VALID |
 		      AMDGPU_GEM_CREATE_EXPLICIT_SYNC |
-		      AMDGPU_GEM_CREATE_ENCRYPTED))
+		      AMDGPU_GEM_CREATE_ENCRYPTED |
+		      AMDGPU_GEM_CREATE_UNCACHED))
 
 		return -EINVAL;
 
@@ -255,8 +306,9 @@ int amdgpu_gem_create_ioctl(struct drm_device *dev, void *data,
 		resv = vm->root.base.bo->tbo.base.resv;
 	}
 
-retry:
 	initial_domain = (u32)(0xffffffff & args->in.domains);
+
+retry:
 	r = amdgpu_gem_object_create(adev, size, args->in.alignment,
 				     initial_domain,
 				     flags, ttm_bo_type_device, resv, &gobj);
@@ -274,7 +326,6 @@ retry:
 			DRM_DEBUG("Failed to allocate GEM object (%llu, %d, %llu, %d)\n",
 				  size, initial_domain, args->in.alignment, r);
 		}
-		return r;
 	}
 
 	if (flags & AMDGPU_GEM_CREATE_VM_ALWAYS_VALID) {
@@ -288,6 +339,8 @@ retry:
 	if (r)
 		return r;
 
+	amdgpu_gem_bo_size(gobj, filp, ADD_BO_SIZE);
+
 	r = drm_gem_handle_create(filp, gobj, &handle);
 	/* drop reference from allocate - handle holds it now */
 	drm_gem_object_put(gobj);
@@ -296,6 +349,7 @@ retry:
 
 	memset(args, 0, sizeof(*args));
 	args->out.handle = handle;
+
 	return 0;
 }
 
@@ -308,7 +362,8 @@ int amdgpu_gem_userptr_ioctl(struct drm_device *dev, void *data,
 	struct drm_gem_object *gobj;
 	struct amdgpu_bo *bo;
 	uint32_t handle;
-	int r;
+	int r, i;
+	long pinned;
 
 	args->addr = untagged_addr(args->addr);
 
@@ -341,14 +396,20 @@ int amdgpu_gem_userptr_ioctl(struct drm_device *dev, void *data,
 	if (r)
 		goto release_object;
 
-	r = amdgpu_mn_register(bo, args->addr);
-	if (r)
-		goto release_object;
-
 	if (args->flags & AMDGPU_GEM_USERPTR_VALIDATE) {
-		r = amdgpu_ttm_tt_get_user_pages(bo, bo->tbo.ttm->pages);
-		if (r)
+		pinned = pin_user_pages_fast(args->addr,
+				bo->tbo.ttm->num_pages,
+				FOLL_WRITE | FOLL_LONGTERM, bo->tbo.ttm->pages);
+		DRM_DEBUG("pin_user_pages_fast bo:%x, ttm:%x add:%lx :%d %d\n",
+				bo, bo->tbo.ttm, args->addr, pinned, bo->tbo.ttm->num_pages);
+		if (pinned != bo->tbo.ttm->num_pages) {
+			for (i = 0; i < pinned; i++)
+				put_page(bo->tbo.ttm->pages[i]);
+			DRM_INFO("pin_user_pages_fast failed :%d %d\n",
+					pinned, bo->tbo.ttm->num_pages);
+			r =  -ENOMEM;
 			goto release_object;
+		}
 
 		r = amdgpu_bo_reserve(bo, true);
 		if (r)
@@ -368,9 +429,6 @@ int amdgpu_gem_userptr_ioctl(struct drm_device *dev, void *data,
 	args->handle = handle;
 
 user_pages_done:
-	if (args->flags & AMDGPU_GEM_USERPTR_VALIDATE)
-		amdgpu_ttm_tt_get_user_pages_done(bo->tbo.ttm);
-
 release_object:
 	drm_gem_object_put(gobj);
 
@@ -420,6 +478,9 @@ unsigned long amdgpu_gem_timeout(uint64_t timeout_ns)
 	unsigned long timeout_jiffies;
 	ktime_t timeout;
 
+	if (sgpu_no_timeout != 0) {
+		return MAX_SCHEDULE_TIMEOUT;
+	}
 	/* clamp timeout if it's to large */
 	if (((int64_t)timeout_ns) < 0)
 		return MAX_SCHEDULE_TIMEOUT;
@@ -503,6 +564,8 @@ int amdgpu_gem_metadata_ioctl(struct drm_device *dev, void *data,
 			r = amdgpu_bo_set_metadata(robj, args->data.data,
 						   args->data.data_size_bytes,
 						   args->data.flags);
+	} else if (args->op == AMDGPU_GEM_METADATA_OP_GET_BO_FLAGS) {
+		args->data.flags = robj->flags;
 	}
 
 unreserve:
@@ -601,6 +664,12 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 	uint64_t va_flags;
 	uint64_t vm_size;
 	int r = 0;
+	struct ttm_operation_ctx ctx = {
+		.interruptible = true,
+		.no_wait_gpu = false,
+		.resv = 0,
+		.flags = 0
+	};
 
 	if (args->va_address < AMDGPU_VA_RESERVED_SIZE) {
 		dev_dbg(&dev->pdev->dev,
@@ -709,9 +778,18 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 	default:
 		break;
 	}
-	if (!r && !(args->flags & AMDGPU_VM_DELAY_UPDATE) && !amdgpu_vm_debug)
+
+	if (abo && abo->tbo.base.import_attach && abo->tbo.base.dma_buf) {
+		ctx.resv = abo->tbo.base.resv;
+		amdgpu_bo_placement_from_domain(abo, AMDGPU_GEM_DOMAIN_GTT);
+		ttm_bo_validate(&abo->tbo, &abo->placement, &ctx);
+	}
+	if (!r && !(args->flags & AMDGPU_VM_DELAY_UPDATE) && !amdgpu_vm_debug) {
 		amdgpu_gem_va_update_vm(adev, &fpriv->vm, bo_va,
 					args->operation);
+
+		(&fpriv->vm)->va_updated = true;
+	}
 
 error_backoff:
 	ttm_eu_backoff_reservation(&ticket, &list);
@@ -835,6 +913,47 @@ int amdgpu_mode_dumb_create(struct drm_file *file_priv,
 		return r;
 	}
 	args->handle = handle;
+	return 0;
+}
+
+void amdgpu_backoff_reservation(struct ww_acquire_ctx *ticket,
+		struct list_head *list)
+{
+	struct ttm_validate_buffer *entry;
+
+	if (list_empty(list))
+		return;
+
+	list_for_each_entry(entry, list, head) {
+		struct ttm_buffer_object *bo = entry->bo;
+		dma_resv_unlock(bo->base.resv);
+	}
+
+	if (ticket)
+		ww_acquire_fini(ticket);
+}
+
+int amdgpu_gem_bo_size(struct drm_gem_object *gobj, struct drm_file *filp, int flag)
+{
+	struct amdgpu_bo *bo = gem_to_amdgpu_bo(gobj);
+	struct amdgpu_fpriv *afpriv = filp->driver_priv;
+
+	if (afpriv == NULL)
+		return 0;
+
+	mutex_lock(&afpriv->memory_lock);
+	if ((bo != NULL) && !(bo->tbo.base.import_attach) && !(bo->tbo.base.dma_buf)) {
+		if (flag == SUB_BO_SIZE)
+			afpriv->total_pages -= bo->tbo.num_pages;
+		else if (flag == ADD_BO_SIZE)
+			afpriv->total_pages += bo->tbo.num_pages;
+	}
+	mutex_unlock(&afpriv->memory_lock);
+
+	trace_gpu_mem_total(0, afpriv->tgid, afpriv->total_pages << PAGE_SHIFT);
+	/* update globla memory information */
+	trace_gpu_mem_total(0, 0, p_adev->num_kernel_pages << PAGE_SHIFT);
+
 	return 0;
 }
 

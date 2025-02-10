@@ -1585,7 +1585,7 @@ static void gfx_v7_0_tiling_mode_table_init(struct amdgpu_device *adev)
  * registers are instanced per SE or SH.  0xffffffff means
  * broadcast to all SEs or SHs (CIK).
  */
-static void gfx_v7_0_select_se_sh(struct amdgpu_device *adev,
+static u32 gfx_v7_0_select_se_sh(struct amdgpu_device *adev,
 				  u32 se_num, u32 sh_num, u32 instance)
 {
 	u32 data;
@@ -1608,6 +1608,8 @@ static void gfx_v7_0_select_se_sh(struct amdgpu_device *adev,
 		data |= (sh_num << GRBM_GFX_INDEX__SH_INDEX__SHIFT) |
 			(se_num << GRBM_GFX_INDEX__SE_INDEX__SHIFT);
 	WREG32(mmGRBM_GFX_INDEX, data);
+
+	return data;
 }
 
 /**

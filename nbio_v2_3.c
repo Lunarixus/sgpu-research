@@ -27,6 +27,9 @@
 #include "nbio/nbio_2_3_default.h"
 #include "nbio/nbio_2_3_offset.h"
 #include "nbio/nbio_2_3_sh_mask.h"
+#include "gc/gc_10_4_0_default.h"
+#include "gc/gc_10_4_0_offset.h"
+#include "gc/gc_10_4_0_sh_mask.h"
 #include <uapi/linux/kfd_ioctl.h>
 
 #define smnPCIE_CONFIG_CNTL	0x11180044
@@ -59,6 +62,11 @@ static u32 nbio_v2_3_get_rev_id(struct amdgpu_device *adev)
 	return tmp;
 }
 
+static u32 nbio_v2_3_get_chip_revision(struct amdgpu_device *adev)
+{
+	return RREG32_SOC15(GC, 0, mmGRBM_CHIP_REVISION);
+}
+
 static void nbio_v2_3_mc_access_enable(struct amdgpu_device *adev, bool enable)
 {
 	if (enable)
@@ -72,6 +80,12 @@ static void nbio_v2_3_mc_access_enable(struct amdgpu_device *adev, bool enable)
 static void nbio_v2_3_hdp_flush(struct amdgpu_device *adev,
 				struct amdgpu_ring *ring)
 {
+	/* Vangogh Lite does not have HDP */
+	/* Not removing function, it is called in several places
+	 * without nullptr check */
+	if (adev->gmc.aper_size == 0)
+		return;
+
 	if (!ring || !ring->funcs->emit_wreg)
 		WREG32_NO_KIQ((adev->rmmio_remap.reg_offset + KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL) >> 2, 0);
 	else
@@ -80,7 +94,10 @@ static void nbio_v2_3_hdp_flush(struct amdgpu_device *adev,
 
 static u32 nbio_v2_3_get_memsize(struct amdgpu_device *adev)
 {
-	return RREG32_SOC15(NBIO, 0, mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE);
+	if (adev->asic_type == CHIP_VANGOGH_LITE)
+		return 0;
+	else
+		return RREG32_SOC15(NBIO, 0, mmRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE);
 }
 
 static void nbio_v2_3_sdma_doorbell_range(struct amdgpu_device *adev, int instance,
@@ -304,6 +321,9 @@ static void nbio_v2_3_init_registers(struct amdgpu_device *adev)
 {
 	uint32_t def, data;
 
+	if (!adev->pdev)
+		return;
+
 	def = data = RREG32_PCIE(smnPCIE_CONFIG_CNTL);
 	data = REG_SET_FIELD(data, PCIE_CONFIG_CNTL, CI_SWUS_MAX_READ_REQUEST_SIZE_MODE, 1);
 	data = REG_SET_FIELD(data, PCIE_CONFIG_CNTL, CI_SWUS_MAX_READ_REQUEST_SIZE_PRIV, 1);
@@ -318,6 +338,7 @@ const struct amdgpu_nbio_funcs nbio_v2_3_funcs = {
 	.get_pcie_index_offset = nbio_v2_3_get_pcie_index_offset,
 	.get_pcie_data_offset = nbio_v2_3_get_pcie_data_offset,
 	.get_rev_id = nbio_v2_3_get_rev_id,
+	.get_chip_revision = nbio_v2_3_get_chip_revision,
 	.mc_access_enable = nbio_v2_3_mc_access_enable,
 	.hdp_flush = nbio_v2_3_hdp_flush,
 	.get_memsize = nbio_v2_3_get_memsize,

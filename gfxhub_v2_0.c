@@ -453,7 +453,6 @@ static void gfxhub_v2_0_init(struct amdgpu_device *adev)
 		SOC15_REG_OFFSET(GC, 0, mmGCVM_L2_PROTECTION_FAULT_STATUS);
 	hub->vm_l2_pro_fault_cntl =
 		SOC15_REG_OFFSET(GC, 0, mmGCVM_L2_PROTECTION_FAULT_CNTL);
-
 	hub->ctx_distance = mmGCVM_CONTEXT1_CNTL - mmGCVM_CONTEXT0_CNTL;
 	hub->ctx_addr_distance = mmGCVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32 -
 		mmGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32;
@@ -471,6 +470,11 @@ static void gfxhub_v2_0_init(struct amdgpu_device *adev)
 		GCVM_CONTEXT1_CNTL__EXECUTE_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK;
 
 	hub->vmhub_funcs = &gfxhub_v2_0_vmhub_funcs;
+
+	hub->vm_l2_pro_fault_addr_lo32 =
+		SOC15_REG_OFFSET(GC, 0, mmGCVM_L2_PROTECTION_FAULT_ADDR_LO32);
+	hub->vm_l2_pro_fault_addr_hi32 =
+		SOC15_REG_OFFSET(GC, 0, mmGCVM_L2_PROTECTION_FAULT_ADDR_HI32);
 }
 
 const struct amdgpu_gfxhub_funcs gfxhub_v2_0_funcs = {

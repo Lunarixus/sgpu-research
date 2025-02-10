@@ -35,6 +35,7 @@
 #include "amdgpu.h"
 #include "atom.h"
 #include "amdgpu_trace.h"
+#include "sgpu_utilization.h"
 
 #define AMDGPU_IB_TEST_TIMEOUT	msecs_to_jiffies(1000)
 #define AMDGPU_IB_TEST_GFX_XGMI_TIMEOUT	msecs_to_jiffies(2000)
@@ -75,8 +76,6 @@ int amdgpu_ib_get(struct amdgpu_device *adev, struct amdgpu_vm *vm,
 		}
 
 		ib->ptr = amdgpu_sa_bo_cpu_addr(ib->sa_bo);
-		/* flush the cache before commit the IB */
-		ib->flags = AMDGPU_IB_FLAG_EMIT_MEM_SYNC;
 
 		if (!vm)
 			ib->gpu_addr = amdgpu_sa_bo_gpu_addr(ib->sa_bo);
@@ -128,7 +127,7 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
 	struct amdgpu_device *adev = ring->adev;
 	struct amdgpu_ib *ib = &ibs[0];
 	struct dma_fence *tmp = NULL;
-	bool need_ctx_switch;
+	bool skip_preamble, need_ctx_switch;
 	unsigned patch_offset = ~0;
 	struct amdgpu_vm *vm;
 	uint64_t fence_ctx;
@@ -139,6 +138,10 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
 	unsigned i;
 	int r = 0;
 	bool need_pipe_sync = false;
+#ifdef CONFIG_PM_DEVFREQ
+	uint32_t job_count = ring->fence_drv.sync_seq;
+	bool cu_job = false;
+#endif /* CONFIG_PM_DEVFREQ */
 
 	if (num_ibs == 0)
 		return -EINVAL;
@@ -221,6 +224,7 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
 	if (need_ctx_switch)
 		status |= AMDGPU_HAVE_CTX_SWITCH;
 
+	skip_preamble = ring->current_ctx == fence_ctx;
 	if (job && ring->funcs->emit_cntxcntl) {
 		status |= job->preamble_status;
 		status |= job->preemption_status;
@@ -238,8 +242,18 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
 	for (i = 0; i < num_ibs; ++i) {
 		ib = &ibs[i];
 
+		/* drop preamble IBs if we don't have a context switch */
+		if ((ib->flags & AMDGPU_IB_FLAG_PREAMBLE) &&
+		    skip_preamble &&
+		    !(status & AMDGPU_PREAMBLE_IB_PRESENT_FIRST) &&
+		    !amdgpu_mcbp &&
+		    !amdgpu_sriov_vf(adev)) /* for SRIOV preemption, Preamble CE ib must be inserted anyway */
+			continue;
+
 		if (job && ring->funcs->emit_frame_cntl) {
-			if (secure != !!(ib->flags & AMDGPU_IB_FLAGS_SECURE)) {
+			/* Compute rings are completely TMZ or not at all, cannot be set by a KMD frame */
+			if (ring->funcs->type != AMDGPU_RING_TYPE_COMPUTE &&
+			    secure != !!(ib->flags & AMDGPU_IB_FLAGS_SECURE)) {
 				amdgpu_ring_emit_frame_cntl(ring, false, secure);
 				secure = !secure;
 				amdgpu_ring_emit_frame_cntl(ring, true, secure);
@@ -285,7 +299,35 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
 	ring->current_ctx = fence_ctx;
 	if (vm && ring->funcs->emit_switch_buffer)
 		amdgpu_ring_emit_switch_buffer(ring);
+
+#ifdef CONFIG_PM_DEVFREQ
+	if (sgpu_enable_dvfs) {
+		if (job) {
+			SGPU_LOG(adev, DMSG_INFO, DMSG_ETC,
+				 "vmid=%u, pasid=%u, drm %llu/%llu/%llu",
+				 job->vmid, job->pasid,
+				 job->base.s_fence->scheduled.context,
+				 job->base.s_fence->finished.context,
+				 job->base.s_fence->finished.seqno);
+		}
+		job_count = ring->fence_drv.sync_seq - job_count;
+		cu_job = (ring->funcs->type == AMDGPU_RING_TYPE_COMPUTE);
+		sgpu_utilization_job_start(ring->adev->devfreq, job_count, cu_job);
+	}
+#endif /* CONFIG_PM_DEVFREQ */
+
+	trace_amdgpu_ib_schedule(ring);
+	if (job && job->ifh_mode &&
+	    (ring->funcs->type == AMDGPU_RING_TYPE_GFX ||
+	     ring->funcs->type == AMDGPU_RING_TYPE_SDMA ||
+	     ring->funcs->type == AMDGPU_RING_TYPE_COMPUTE)) {
+		amdgpu_ring_undo(ring);
+		goto out;
+	}
+
 	amdgpu_ring_commit(ring);
+
+out:
 	return 0;
 }
 
@@ -364,6 +406,9 @@ int amdgpu_ib_ring_tests(struct amdgpu_device *adev)
 	int r, ret = 0;
 	unsigned i;
 
+	if (sgpu_no_hw_access != 0)
+		return 0;
+
 	tmo_mm = tmo_gfx = AMDGPU_IB_TEST_TIMEOUT;
 	if (amdgpu_sriov_vf(adev)) {
 		/* for MM engines in hypervisor side they are not scheduled together
@@ -385,6 +430,9 @@ int amdgpu_ib_ring_tests(struct amdgpu_device *adev)
 		tmo_gfx = AMDGPU_IB_TEST_GFX_XGMI_TIMEOUT;
 	}
 
+	if (sgpu_no_timeout != 0) {
+		tmo_gfx = MAX_SCHEDULE_TIMEOUT;
+	}
 	for (i = 0; i < adev->num_rings; ++i) {
 		struct amdgpu_ring *ring = adev->rings[i];
 		long tmo;

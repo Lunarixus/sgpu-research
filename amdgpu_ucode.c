@@ -380,6 +380,8 @@ amdgpu_ucode_get_load_type(struct amdgpu_device *adev, int load_type)
 	case CHIP_POLARIS12:
 	case CHIP_VEGAM:
 		return AMDGPU_FW_LOAD_SMU;
+	case CHIP_VANGOGH_LITE:
+		return AMDGPU_FW_LOAD_RLC_BACKDOOR_AUTO;
 	case CHIP_VEGA10:
 	case CHIP_RAVEN:
 	case CHIP_VEGA12:
@@ -607,6 +609,10 @@ static int amdgpu_ucode_patch_jt(struct amdgpu_firmware_info *ucode,
 
 int amdgpu_ucode_create_bo(struct amdgpu_device *adev)
 {
+	if ((adev->asic_type == CHIP_VANGOGH_LITE) &&
+		(adev->firmware.load_type == AMDGPU_FW_LOAD_RLC_BACKDOOR_AUTO))
+		return 0;
+
 	if (adev->firmware.load_type != AMDGPU_FW_LOAD_DIRECT) {
 		amdgpu_bo_create_kernel(adev, adev->firmware.fw_size, PAGE_SIZE,
 			amdgpu_sriov_vf(adev) ? AMDGPU_GEM_DOMAIN_VRAM : AMDGPU_GEM_DOMAIN_GTT,
@@ -625,7 +631,12 @@ int amdgpu_ucode_create_bo(struct amdgpu_device *adev)
 
 void amdgpu_ucode_free_bo(struct amdgpu_device *adev)
 {
-	amdgpu_bo_free_kernel(&adev->firmware.fw_buf,
+	if ((adev->asic_type == CHIP_VANGOGH_LITE) &&
+		(adev->firmware.load_type == AMDGPU_FW_LOAD_RLC_BACKDOOR_AUTO))
+		return;
+
+	if (adev->firmware.load_type != AMDGPU_FW_LOAD_DIRECT)
+		amdgpu_bo_free_kernel(&adev->firmware.fw_buf,
 		&adev->firmware.fw_buf_mc,
 		&adev->firmware.fw_buf_ptr);
 }

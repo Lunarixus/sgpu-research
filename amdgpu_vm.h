@@ -1,5 +1,5 @@
 /*
- * Copyright 2016 Advanced Micro Devices, Inc.
+ * Copyright 2016-2021 Advanced Micro Devices, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -112,11 +112,13 @@ struct amdgpu_bo_list_entry;
 #define AMDGPU_MMHUB_0				1
 #define AMDGPU_MMHUB_1				2
 
-/* Reserve 2MB at top/bottom of address space for kernel use */
-#define AMDGPU_VA_RESERVED_SIZE			(2ULL << 20)
+/* Reserve 128MB at top/bottom of address space for kernel use */
+#define AMDGPU_VA_RESERVED_SIZE			(1ULL << 27)
 
 /* max vmids dedicated for process */
-#define AMDGPU_VM_MAX_RESERVED_VMID	1
+#define AMDGPU_VM_MAX_RESERVED_VMID	8
+/* Add 8 CWSR reserved VMID when CONFIG_HSA_AMD is not enabled */
+#define AMDGPU_VM_MAX_RESERVED_CWSR_VMID 16
 
 #define AMDGPU_VM_CONTEXT_GFX 0
 #define AMDGPU_VM_CONTEXT_COMPUTE 1
@@ -288,6 +290,8 @@ struct amdgpu_vm {
 	unsigned int		pasid;
 	/* dedicated to vm */
 	struct amdgpu_vmid	*reserved_vmid[AMDGPU_MAX_VMHUBS];
+	/* same vmid can be referenced in different context */
+	refcount_t reserved_vmid_ref[AMDGPU_MAX_VMHUBS];
 
 	/* Flag to indicate if VM tables are updated by CPU or GPU (SDMA) */
 	bool					use_cpu_for_update;
@@ -319,13 +323,17 @@ struct amdgpu_vm {
 	bool			bulk_moveable;
 	/* Flag to indicate if VM is used for compute */
 	bool			is_compute_context;
+	/* Flag to indicate if VM is updated */
+	bool			va_updated;
+
+	/* Flag to exit process */
+	unsigned long		process_flags;
 };
 
 struct amdgpu_vm_manager {
 	/* Handling of VMIDs */
 	struct amdgpu_vmid_mgr			id_mgr[AMDGPU_MAX_VMHUBS];
 	unsigned int				first_kfd_vmid;
-	bool					concurrent_flush;
 
 	/* Handling of VM fences */
 	u64					fence_context;
@@ -441,5 +449,14 @@ void amdgpu_vm_set_task_info(struct amdgpu_vm *vm);
 void amdgpu_vm_move_to_lru_tail(struct amdgpu_device *adev,
 				struct amdgpu_vm *vm);
 void amdgpu_vm_del_from_lru_notify(struct ttm_buffer_object *bo);
+
+uint64_t sgpu_page_walk(struct amdgpu_device *adev, uint32_t vmid,
+			uint64_t gva);
+
+#ifdef CONFIG_DRM_SGPU_BPMD
+int sgpu_bpmd_dump_vm(struct file *f,
+		      struct amdgpu_vm *vm,
+		      uint32_t vmid);
+#endif /* CONFIG_DRM_SGPU_BPMD */
 
 #endif

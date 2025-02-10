@@ -90,10 +90,20 @@ static int amdgpu_vm_cpu_update(struct amdgpu_vm_update_params *p,
 		value = p->pages_addr ?
 			amdgpu_vm_map_gart(p->pages_addr, addr) :
 			addr;
+
+		if (trace_amdgpu_vm_pte_pde_enabled() &&
+		    (incr != 0 || count == 1)) {
+			/* trace only valid pde and pte */
+			trace_amdgpu_vm_pte_pde(pe + i * 8, value, flags,
+						incr != 0 ? true : false);
+		}
 		amdgpu_gmc_set_pte_pde(p->adev, (void *)(uintptr_t)pe,
 				       i, value, flags);
 		addr += incr;
 	}
+
+	wmb();
+
 	return 0;
 }
 

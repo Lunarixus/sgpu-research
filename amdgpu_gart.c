@@ -75,10 +75,10 @@ static int amdgpu_gart_dummy_page_init(struct amdgpu_device *adev)
 
 	if (adev->dummy_page_addr)
 		return 0;
-	adev->dummy_page_addr = pci_map_page(adev->pdev, dummy_page, 0,
-					     PAGE_SIZE, PCI_DMA_BIDIRECTIONAL);
-	if (pci_dma_mapping_error(adev->pdev, adev->dummy_page_addr)) {
-		dev_err(&adev->pdev->dev, "Failed to DMA MAP the dummy page\n");
+	adev->dummy_page_addr = dma_map_page(&adev->pldev->dev, dummy_page, 0,
+					     PAGE_SIZE, DMA_BIDIRECTIONAL);
+	if (dma_mapping_error(&adev->pldev->dev, adev->dummy_page_addr)) {
+		dev_err(&adev->pldev->dev, "Failed to DMA MAP the dummy page\n");
 		adev->dummy_page_addr = 0;
 		return -ENOMEM;
 	}
@@ -96,8 +96,8 @@ static void amdgpu_gart_dummy_page_fini(struct amdgpu_device *adev)
 {
 	if (!adev->dummy_page_addr)
 		return;
-	pci_unmap_page(adev->pdev, adev->dummy_page_addr,
-		       PAGE_SIZE, PCI_DMA_BIDIRECTIONAL);
+	dma_unmap_page(&adev->pldev->dev, adev->dummy_page_addr,
+		       PAGE_SIZE, DMA_BIDIRECTIONAL);
 	adev->dummy_page_addr = 0;
 }
 
@@ -131,6 +131,41 @@ int amdgpu_gart_table_vram_alloc(struct amdgpu_device *adev)
 			return r;
 		}
 	}
+	return 0;
+}
+
+/**
+ * amdgpu_gart_table_sysram_alloc - allocate sysram for gart page table
+ *
+ * @adev: amdgpu_device pointer
+ *
+ * Allocate system ram memory for GART page table
+ * Returns 0 for success, error for failure.
+ */
+int amdgpu_gart_table_sysram_alloc(struct amdgpu_device *adev)
+{
+	if (adev->csm_gart_paddr == 0) {
+		/*
+		 * Note: 64B alignment is required by HW, dma_alloc_coherent()
+		 * returns address which is guaranteed to be aligned to the
+		 * smallest PAGE_SIZE order which is greater than or equal to
+		 * the requested size.
+		 */
+		adev->csm_gart_vaddr =
+				dma_alloc_coherent(adev->dev,
+						   adev->gart.table_size,
+						   &adev->csm_gart_paddr,
+						   GFP_KERNEL);
+		if (adev->csm_gart_vaddr == NULL) {
+			adev->csm_gart_paddr = 0;
+			return -ENOMEM;
+		}
+
+		adev->gart.ptr = adev->csm_gart_vaddr;
+		DRM_INFO("set gart memory @phy_0x%llx @virt_%p\n",
+			 adev->csm_gart_paddr, adev->csm_gart_vaddr);
+	}
+
 	return 0;
 }
 
@@ -202,6 +237,27 @@ void amdgpu_gart_table_vram_free(struct amdgpu_device *adev)
 		return;
 	}
 	amdgpu_bo_unref(&adev->gart.bo);
+}
+
+/**
+ * amdgpu_gart_table_sysram_free - free gart page table
+ *
+ * @adev: amdgpu_device pointer
+ *
+ * Free the system ram memory used for the GART page table
+ */
+void amdgpu_gart_table_sysram_free(struct amdgpu_device *adev)
+{
+	if (!adev->csm_gart_paddr)
+		return;
+
+	dma_free_coherent(adev->dev, adev->gart.table_size,
+			  adev->csm_gart_vaddr,
+			  (dma_addr_t)adev->csm_gart_paddr);
+
+	adev->gart.ptr = NULL;
+	adev->csm_gart_paddr = 0;
+	adev->csm_gart_vaddr = NULL;
 }
 
 /*
@@ -291,6 +347,9 @@ int amdgpu_gart_map(struct amdgpu_device *adev, uint64_t offset,
 			page_base += AMDGPU_GPU_PAGE_SIZE;
 		}
 	}
+
+	mb();
+
 	return 0;
 }
 
@@ -337,7 +396,6 @@ int amdgpu_gart_bind(struct amdgpu_device *adev, uint64_t offset,
 	if (r)
 		return r;
 
-	mb();
 	amdgpu_asic_flush_hdp(adev, NULL);
 	for (i = 0; i < adev->num_vmhubs; i++)
 		amdgpu_gmc_flush_gpu_tlb(adev, 0, i, 0);

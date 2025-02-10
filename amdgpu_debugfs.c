@@ -1,5 +1,5 @@
 /*
- * Copyright 2008 Advanced Micro Devices, Inc.
+ * Copyright 2008-2021 Advanced Micro Devices, Inc.
  * Copyright 2008 Red Hat Inc.
  * Copyright 2009 Jerome Glisse.
  *
@@ -35,6 +35,10 @@
 #include "amdgpu_dm_debugfs.h"
 #include "amdgpu_ras.h"
 #include "amdgpu_rap.h"
+#include "amdgpu_sws.h"
+#include "amdgpu_cwsr.h"
+#include "sgpu_bpmd.h"
+#include "sgpu_debugfs.h"
 
 /**
  * amdgpu_debugfs_add_files - Add simple debugfs entries
@@ -77,7 +81,7 @@ int amdgpu_debugfs_add_files(struct amdgpu_device *adev,
 
 int amdgpu_debugfs_wait_dump(struct amdgpu_device *adev)
 {
-#if defined(CONFIG_DEBUG_FS)
+#if defined(CONFIG_DEBUG_FS) && !defined(CONFIG_DRM_SGPU_EXYNOS)
 	unsigned long timeout = 600 * HZ;
 	int ret;
 
@@ -92,7 +96,7 @@ int amdgpu_debugfs_wait_dump(struct amdgpu_device *adev)
 	return 0;
 }
 
-#if defined(CONFIG_DEBUG_FS)
+#if defined(CONFIG_DEBUG_FS) && !defined(CONFIG_DRM_SGPU_EXYNOS)
 
 static int amdgpu_debugfs_autodump_open(struct inode *inode, struct file *file)
 {
@@ -355,7 +359,7 @@ static ssize_t amdgpu_debugfs_regs_pcie_read(struct file *f, char __user *buf,
 	while (size) {
 		uint32_t value;
 
-		value = RREG32_PCIE(*pos);
+		value = RREG32_PCIE(*pos >> 2);
 		r = put_user(value, (uint32_t *)buf);
 		if (r) {
 			pm_runtime_mark_last_busy(adev_to_drm(adev)->dev);
@@ -422,7 +426,7 @@ static ssize_t amdgpu_debugfs_regs_pcie_write(struct file *f, const char __user 
 			return r;
 		}
 
-		WREG32_PCIE(*pos, value);
+		WREG32_PCIE(*pos >> 2, value);
 
 		result += 4;
 		buf += 4;
@@ -705,7 +709,7 @@ static ssize_t amdgpu_debugfs_gca_config_read(struct file *f, char __user *buf,
 		return -ENOMEM;
 
 	/* version, increment each time something is added */
-	config[no_regs++] = 3;
+	config[no_regs++] = 2;
 	config[no_regs++] = adev->gfx.config.max_shader_engines;
 	config[no_regs++] = adev->gfx.config.max_tile_pipes;
 	config[no_regs++] = adev->gfx.config.max_cu_per_sh;
@@ -738,12 +742,6 @@ static ssize_t amdgpu_debugfs_gca_config_read(struct file *f, char __user *buf,
 	/* rev==2 */
 	config[no_regs++] = adev->family;
 	config[no_regs++] = adev->external_rev_id;
-
-	/* rev==3 */
-	config[no_regs++] = adev->pdev->device;
-	config[no_regs++] = adev->pdev->revision;
-	config[no_regs++] = adev->pdev->subsystem_device;
-	config[no_regs++] = adev->pdev->subsystem_vendor;
 
 	while (size && (*pos < no_regs * 4)) {
 		uint32_t value;
@@ -1556,11 +1554,14 @@ DEFINE_SIMPLE_ATTRIBUTE(fops_ib_preempt, NULL,
 
 DEFINE_SIMPLE_ATTRIBUTE(fops_sclk_set, NULL,
 			amdgpu_debugfs_sclk_set, "%llu\n");
+#endif
 
+
+#if defined(CONFIG_DEBUG_FS)
 int amdgpu_debugfs_init(struct amdgpu_device *adev)
 {
 	int r, i;
-
+#if defined(CONFIG_DEBUG_FS) && !defined(CONFIG_DRM_SGPU_EXYNOS)
 	adev->debugfs_preempt =
 		debugfs_create_file("amdgpu_preempt_ib", 0600,
 				    adev_to_drm(adev)->primary->debugfs_root, adev,
@@ -1595,18 +1596,18 @@ int amdgpu_debugfs_init(struct amdgpu_device *adev)
 	if (amdgpu_debugfs_sa_init(adev)) {
 		dev_err(adev->dev, "failed to register debugfs file for SA\n");
 	}
-
+#endif
 	if (amdgpu_debugfs_fence_init(adev))
 		dev_err(adev->dev, "fence debugfs file creation failed\n");
 
 	r = amdgpu_debugfs_gem_init(adev);
 	if (r)
 		DRM_ERROR("registering gem debugfs failed (%d).\n", r);
-
+#if defined(CONFIG_DEBUG_FS) && !defined(CONFIG_DRM_SGPU_EXYNOS)
 	r = amdgpu_debugfs_regs_init(adev);
 	if (r)
 		DRM_ERROR("registering register debugfs failed (%d).\n", r);
-
+#endif
 	r = amdgpu_debugfs_firmware_init(adev);
 	if (r)
 		DRM_ERROR("registering firmware debugfs failed (%d).\n", r);
@@ -1628,15 +1629,33 @@ int amdgpu_debugfs_init(struct amdgpu_device *adev)
 			DRM_ERROR("Failed to register debugfs file for rings !\n");
 		}
 	}
-
+#if defined(CONFIG_DEBUG_FS) && !defined(CONFIG_DRM_SGPU_EXYNOS)
 	amdgpu_ras_debugfs_create_all(adev);
 
 	amdgpu_debugfs_autodump_init(adev);
 
 	amdgpu_rap_debugfs_init(adev);
+#endif
+	if (sgpu_debugfs_bpmd_init(adev) != 0) {
+		DRM_ERROR("unable to create sgpu_bpmd debugsfs file\n");
+		return -EIO;
+	}
+	sgpu_debugfs_jobtimeout_to_panic_init(adev);
 
+	if (sgpu_debugfs_dmsg_init(adev) != 0)
+		return -EIO;
+
+	if (sgpu_instance_data_debugfs_init(adev) != 0)
+		return -EIO;
+
+	if (cwsr_enable || amdgpu_tmz)
+		amdgpu_sws_init_debugfs(adev);
+#if defined(CONFIG_DEBUG_FS) && !defined(CONFIG_DRM_SGPU_EXYNOS)
 	return amdgpu_debugfs_add_files(adev, amdgpu_debugfs_list,
 					ARRAY_SIZE(amdgpu_debugfs_list));
+#else
+	return 0;
+#endif
 }
 
 #else
@@ -1649,3 +1668,137 @@ int amdgpu_debugfs_regs_init(struct amdgpu_device *adev)
 	return 0;
 }
 #endif
+
+#if defined(CONFIG_DRM_SGPU_BPMD) && defined(CONFIG_DEBUG_FS)
+static int sgpu_debugfs_bpmd_show(struct seq_file *m, void *p)
+{
+	seq_printf(m, "Write 1 to this file to force trigger BPMD\n");
+	return 0;
+}
+
+static int sgpu_debugfs_bpmd_open(struct inode *inode, struct file *f)
+{
+	return single_open(f, sgpu_debugfs_bpmd_show, inode->i_private);
+}
+
+static ssize_t sgpu_debugfs_bpmd_write(struct file *f, const char __user *data,
+				       size_t len, loff_t *loff)
+{
+	char buf = '0';
+	const size_t buf_size = 1;
+
+	if(copy_from_user(&buf, data, buf_size))
+		return -1;
+
+	if (buf == '1') {
+		struct amdgpu_device *sdev = file_inode(f)->i_private;
+		sgpu_bpmd_dump(sdev);
+	}
+
+	return len;
+}
+
+static struct file_operations sgpu_debugfs_bpmd_fops = {
+	.open    = sgpu_debugfs_bpmd_open,
+	.read    = seq_read,
+	.write   = sgpu_debugfs_bpmd_write,
+	.llseek  = seq_lseek,
+	.release = single_release
+};
+
+int sgpu_debugfs_bpmd_init(struct amdgpu_device *sdev)
+{
+	sdev->debugfs_bpmd =
+		debugfs_create_file("sgpu_bpmd", S_IRUSR | S_IWUSR,
+				    adev_to_drm(sdev)->primary->debugfs_root,
+				    (void *)sdev, &sgpu_debugfs_bpmd_fops);
+
+	if (sdev->debugfs_bpmd == NULL) {
+		pr_err("unable to create sgpu_bpmd debugsfs file\n");
+		return -EIO;
+	}
+	return 0;
+}
+
+void sgpu_debugfs_bpmd_cleanup(struct amdgpu_device *sdev)
+{
+	if (sdev->debugfs_bpmd != NULL)
+		debugfs_remove(sdev->debugfs_bpmd);
+}
+
+
+#else  /* CONFIG_DRM_SGPU_BPMD && CONFIG_DEBUG_FS */
+
+int sgpu_debugfs_bpmd_init(struct amdgpu_device *sdev)
+{
+	return 0;
+}
+
+void sgpu_debugfs_bpmd_cleanup(struct amdgpu_device *sdev) { }
+
+#endif  /* CONFIG_DRM_SGPU_BPMD && CONFIG_DEBUG_FS */
+
+#if defined(CONFIG_DRM_SGPU_EXYNOS) && defined(CONFIG_DEBUG_FS)
+static int sgpu_jobtimeout_to_panic_show(struct seq_file *m, void *p)
+{
+	seq_printf(m, "%d\n", sgpu_jobtimeout_to_panic);
+	return 0;
+}
+
+static ssize_t sgpu_jobtimeout_to_panic_write(struct file *f, const char __user *data,
+				     size_t len, loff_t *loff)
+{
+	char buf = '0';
+	const size_t buf_size = 1;
+
+	if (copy_from_user(&buf, data, buf_size))
+		return -1;
+
+	if (buf == '0')
+		sgpu_jobtimeout_to_panic = 0;
+	else if (buf == '1')
+		sgpu_jobtimeout_to_panic = 1;
+	else
+		return -1;
+
+	return len;
+}
+
+static int sgpu_jobtimeout_to_panic_open(struct inode *inode, struct file *f)
+{
+	return single_open(f, sgpu_jobtimeout_to_panic_show, inode->i_private);
+}
+
+static struct file_operations sgpu_debugfs_jobtimeout_to_panic_fops = {
+	.owner	 = THIS_MODULE,
+	.open	 = sgpu_jobtimeout_to_panic_open,
+	.read	 = seq_read,
+	.write   = sgpu_jobtimeout_to_panic_write,
+	.llseek  = seq_lseek,
+	.release = single_release
+};
+
+int sgpu_debugfs_jobtimeout_to_panic_init(struct amdgpu_device *adev)
+{
+	struct drm_minor *minor = adev_to_drm(adev)->primary;
+	struct dentry *ent, *root = minor->debugfs_root;
+
+	ent = debugfs_create_file("jobtimeout_to_panic", S_IRUGO | S_IWUSR,
+				  root, adev,
+				  &sgpu_debugfs_jobtimeout_to_panic_fops);
+	if (!ent) {
+		DRM_ERROR("unable to create jobtimeout_to_panic debugfs file\n");
+		return -EIO;
+	}
+	adev->debugfs_jobtimeout_to_panic = ent;
+
+	return 0;
+}
+
+#else /* CONFIG_DRM_SGPU_EXYNOS && CONFIG_DEBUG_FS */
+int sgpu_debugfs_jobtimeout_to_panic_init(struct amdgpu_device *adev)
+{
+	return 0;
+}
+
+#endif  /* CONFIG_DRM_SGPU_EXYNOS && CONFIG_DEBUG_FS */

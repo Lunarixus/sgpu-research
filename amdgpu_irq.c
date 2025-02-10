@@ -219,6 +219,8 @@ static void amdgpu_irq_handle_ih2(struct work_struct *work)
  */
 static bool amdgpu_msi_ok(struct amdgpu_device *adev)
 {
+	if (!adev->pdev)
+		return false;
 	if (amdgpu_msi == 1)
 		return true;
 	else if (amdgpu_msi == 0)
@@ -241,6 +243,14 @@ static bool amdgpu_msi_ok(struct amdgpu_device *adev)
 int amdgpu_irq_init(struct amdgpu_device *adev)
 {
 	int r = 0;
+	int irq = 0;
+
+	if (adev->pldev) {
+		irq = platform_get_irq(adev->pldev, 0);
+		DRM_INFO("irq number: %d\n", irq);
+		if (irq < 0)
+			return irq;
+	}
 
 	spin_lock_init(&adev->irq.lock);
 
@@ -251,7 +261,8 @@ int amdgpu_irq_init(struct amdgpu_device *adev)
 		int nvec = pci_msix_vec_count(adev->pdev);
 		unsigned int flags;
 
-		if (nvec <= 0) {
+		/* Only MSI is supported on Gopher */
+		if (amdgpu_emu_mode || nvec <= 0) {
 			flags = PCI_IRQ_MSI;
 		} else {
 			flags = PCI_IRQ_MSI | PCI_IRQ_MSIX;
@@ -267,6 +278,7 @@ int amdgpu_irq_init(struct amdgpu_device *adev)
 	if (!amdgpu_device_has_dc_support(adev)) {
 		if (!adev->enable_virtual_display)
 			/* Disable vblank IRQs aggressively for power-saving */
+			/* XXX: can this be enabled for DC? */
 			adev_to_drm(adev)->vblank_disable_immediate = true;
 
 		r = drm_vblank_init(adev_to_drm(adev), adev->mode_info.num_crtc);
@@ -283,7 +295,9 @@ int amdgpu_irq_init(struct amdgpu_device *adev)
 
 	adev->irq.installed = true;
 	/* Use vector 0 for MSI-X */
-	r = drm_irq_install(adev_to_drm(adev), pci_irq_vector(adev->pdev, 0));
+	r = drm_irq_install(adev_to_drm(adev),
+			    adev->pdev ? pci_irq_vector(adev->pdev, 0) :
+			    irq);
 	if (r) {
 		adev->irq.installed = false;
 		if (!amdgpu_device_has_dc_support(adev))
@@ -498,7 +512,7 @@ void amdgpu_irq_gpu_reset_resume_helper(struct amdgpu_device *adev)
 		for (j = 0; j < AMDGPU_MAX_IRQ_SRC_ID; ++j) {
 			struct amdgpu_irq_src *src = adev->irq.client[i].sources[j];
 
-			if (!src || !src->funcs || !src->funcs->set)
+			if (!src)
 				continue;
 			for (k = 0; k < src->num_types; k++)
 				amdgpu_irq_update(adev, src, k);
