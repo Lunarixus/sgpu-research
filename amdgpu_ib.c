@@ -34,7 +34,6 @@
 #include "amdgpu.h"
 #include "atom.h"
 #include "amdgpu_trace.h"
-#include "sgpu_utilization.h"
 
 #define AMDGPU_IB_TEST_TIMEOUT	msecs_to_jiffies(1000)
 #define AMDGPU_IB_TEST_GFX_XGMI_TIMEOUT	msecs_to_jiffies(2000)
@@ -142,10 +141,6 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
 	unsigned i;
 	int r = 0;
 	bool need_pipe_sync = false;
-#ifdef CONFIG_PM_DEVFREQ
-	uint32_t job_count = ring->fence_drv.sync_seq;
-	bool cu_job = false;
-#endif /* CONFIG_PM_DEVFREQ */
 
 	if (num_ibs == 0)
 		return -EINVAL;
@@ -160,19 +155,19 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
 		fence_ctx = 0;
 	}
 
-	if (!ring->sched.ready) {
+	if (!ring->sched.ready && !ring->is_mes_queue) {
 		dev_err(adev->dev, "couldn't schedule ib on ring <%s>\n", ring->name);
 		return -EINVAL;
 	}
 
-	if (vm && !job->vmid) {
+	if (vm && !job->vmid && !ring->is_mes_queue) {
 		dev_err(adev->dev, "VM IB without ID\n");
 		return -EINVAL;
 	}
 
 	if ((ib->flags & AMDGPU_IB_FLAGS_SECURE) &&
-	    (ring->funcs->type == AMDGPU_RING_TYPE_COMPUTE)) {
-		dev_err(adev->dev, "secure submissions not supported on compute rings\n");
+	    (!ring->funcs->secure_submission_supported)) {
+		dev_err(adev->dev, "secure submissions not supported on ring <%s>\n", ring->name);
 		return -EINVAL;
 	}
 
@@ -221,14 +216,6 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
 
 	amdgpu_device_flush_hdp(adev, ring);
 
-	/* Setup initial TMZiness and send it off.
-	 */
-	secure = false;
-	if (job && ring->funcs->emit_frame_cntl) {
-		secure = ib->flags & AMDGPU_IB_FLAGS_SECURE;
-		amdgpu_ring_emit_frame_cntl(ring, true, secure);
-	}
-
 	if (need_ctx_switch)
 		status |= AMDGPU_HAVE_CTX_SWITCH;
 
@@ -238,15 +225,19 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
 		amdgpu_ring_emit_cntxcntl(ring, status);
 	}
 
+	/* Setup initial TMZiness and send it off.
+	 */
+	secure = false;
+	if (job && ring->funcs->emit_frame_cntl) {
+		secure = ib->flags & AMDGPU_IB_FLAGS_SECURE;
+		amdgpu_ring_emit_frame_cntl(ring, true, secure);
+	}
+
 	for (i = 0; i < num_ibs; ++i) {
 		ib = &ibs[i];
 
 		if (job && ring->funcs->emit_frame_cntl) {
-			/* Compute rings are completely TMZ or not at all,
-			 * cannot be set by a KMD frame
-			 */
-			if (ring->funcs->type != AMDGPU_RING_TYPE_COMPUTE &&
-			    secure != !!(ib->flags & AMDGPU_IB_FLAGS_SECURE)) {
+			if (secure != !!(ib->flags & AMDGPU_IB_FLAGS_SECURE)) {
 				amdgpu_ring_emit_frame_cntl(ring, false, secure);
 				secure = !secure;
 				amdgpu_ring_emit_frame_cntl(ring, true, secure);
@@ -287,47 +278,14 @@ int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned num_ibs,
 		amdgpu_ring_patch_cond_exec(ring, patch_offset);
 
 	ring->current_ctx = fence_ctx;
-	if (adev->asic_type != CHIP_VANGOGH_LITE) {
-		if (vm && ring->funcs->emit_switch_buffer)
-			amdgpu_ring_emit_switch_buffer(ring);
-	}
+	if (vm && ring->funcs->emit_switch_buffer)
+		amdgpu_ring_emit_switch_buffer(ring);
 
 	if (ring->funcs->emit_wave_limit &&
 	    ring->hw_prio == AMDGPU_GFX_PIPE_PRIO_HIGH)
 		ring->funcs->emit_wave_limit(ring, false);
 
-#ifdef CONFIG_PM_DEVFREQ
-	if (sgpu_enable_dvfs) {
-		if (job) {
-			SGPU_LOG(adev, DMSG_INFO, DMSG_ETC,
-				 "%s-%d: vmid=%u, pasid=%u, drm %llu/%llu/%llu, secure = %d",
-				 ring->name, job->base.id, job->vmid, job->pasid,
-				 job->base.s_fence->scheduled.context,
-				 job->base.s_fence->finished.context,
-				 job->base.s_fence->finished.seqno, secure);
-		}
-		job_count = ring->fence_drv.sync_seq - job_count;
-		cu_job = (ring->funcs->type == AMDGPU_RING_TYPE_COMPUTE);
-		sgpu_utilization_job_start(ring->adev->devfreq, job_count, cu_job);
-	}
-#endif /* CONFIG_PM_DEVFREQ */
-
-	/* dma_fence_cb will be added to measure gpu_work_period end_time */
-	if (sgpu_gpuwork_calculation)
-		sgpu_worktime_start(job, *f);
-
-	trace_amdgpu_ib_schedule(ring);
-	if (job && job->ifh_mode &&
-	    (ring->funcs->type == AMDGPU_RING_TYPE_GFX ||
-	     ring->funcs->type == AMDGPU_RING_TYPE_SDMA ||
-	     ring->funcs->type == AMDGPU_RING_TYPE_COMPUTE)) {
-		amdgpu_ring_undo(ring);
-		goto out;
-	}
-
 	amdgpu_ring_commit(ring);
-
-out:
 	return 0;
 }
 
@@ -342,20 +300,15 @@ out:
  */
 int amdgpu_ib_pool_init(struct amdgpu_device *adev)
 {
-	unsigned size;
 	int r, i;
 
 	if (adev->ib_pool_ready)
 		return 0;
 
 	for (i = 0; i < AMDGPU_IB_POOL_MAX; i++) {
-		if (i == AMDGPU_IB_POOL_DIRECT)
-			size = PAGE_SIZE * 6;
-		else
-			size = AMDGPU_IB_POOL_SIZE;
-
 		r = amdgpu_sa_bo_manager_init(adev, &adev->ib_pools[i],
-					      size, AMDGPU_GPU_PAGE_SIZE,
+					      AMDGPU_IB_POOL_SIZE,
+					      AMDGPU_GPU_PAGE_SIZE,
 					      AMDGPU_GEM_DOMAIN_GTT);
 		if (r)
 			goto error;
@@ -427,9 +380,6 @@ int amdgpu_ib_ring_tests(struct amdgpu_device *adev)
 		tmo_gfx = AMDGPU_IB_TEST_GFX_XGMI_TIMEOUT;
 	}
 
-	if (sgpu_no_timeout != 0)
-		tmo_gfx = MAX_SCHEDULE_TIMEOUT;
-
 	for (i = 0; i < adev->num_rings; ++i) {
 		struct amdgpu_ring *ring = adev->rings[i];
 		long tmo;
@@ -438,6 +388,10 @@ int amdgpu_ib_ring_tests(struct amdgpu_device *adev)
 		 * to them and they have no interrupt support.
 		 */
 		if (!ring->sched.ready || !ring->funcs->test_ib)
+			continue;
+
+		if (adev->enable_mes &&
+		    ring->funcs->type == AMDGPU_RING_TYPE_KIQ)
 			continue;
 
 		/* MM engine need more time */

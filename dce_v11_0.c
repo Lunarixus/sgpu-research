@@ -25,6 +25,7 @@
 #include <drm/drm_vblank.h>
 
 #include "amdgpu.h"
+#include "amdgpu_pm.h"
 #include "amdgpu_i2c.h"
 #include "vid.h"
 #include "atom.h"
@@ -1067,6 +1068,17 @@ static void dce_v11_0_program_watermarks(struct amdgpu_device *adev,
 					  (u32)mode->clock);
 		line_time = min(line_time, (u32)65535);
 
+		/* watermark for high clocks */
+		if (adev->pm.dpm_enabled) {
+			wm_high.yclk =
+				amdgpu_dpm_get_mclk(adev, false) * 10;
+			wm_high.sclk =
+				amdgpu_dpm_get_sclk(adev, false) * 10;
+		} else {
+			wm_high.yclk = adev->pm.current_mclk * 10;
+			wm_high.sclk = adev->pm.current_sclk * 10;
+		}
+
 		wm_high.disp_clk = mode->clock;
 		wm_high.src_width = mode->crtc_hdisplay;
 		wm_high.active_time = active_time;
@@ -1093,6 +1105,17 @@ static void dce_v11_0_program_watermarks(struct amdgpu_device *adev,
 		    !dce_v11_0_check_latency_hiding(&wm_high) ||
 		    (adev->mode_info.disp_priority == 2)) {
 			DRM_DEBUG_KMS("force priority to high\n");
+		}
+
+		/* watermark for low clocks */
+		if (adev->pm.dpm_enabled) {
+			wm_low.yclk =
+				amdgpu_dpm_get_mclk(adev, true) * 10;
+			wm_low.sclk =
+				amdgpu_dpm_get_sclk(adev, true) * 10;
+		} else {
+			wm_low.yclk = adev->pm.current_mclk * 10;
+			wm_low.sclk = adev->pm.current_sclk * 10;
 		}
 
 		wm_low.disp_clk = mode->clock;
@@ -2584,6 +2607,8 @@ static void dce_v11_0_crtc_dpms(struct drm_crtc *crtc, int mode)
 		amdgpu_crtc->enabled = false;
 		break;
 	}
+	/* adjust pm to dpms */
+	amdgpu_dpm_compute_clocks(adev);
 }
 
 static void dce_v11_0_crtc_prepare(struct drm_crtc *crtc)
@@ -2890,6 +2915,8 @@ static int dce_v11_0_sw_init(void *handle)
 
 	adev_to_drm(adev)->mode_config.preferred_depth = 24;
 	adev_to_drm(adev)->mode_config.prefer_shadow = 1;
+
+	adev_to_drm(adev)->mode_config.fb_modifiers_not_supported = true;
 
 	adev_to_drm(adev)->mode_config.fb_base = adev->gmc.aper_base;
 

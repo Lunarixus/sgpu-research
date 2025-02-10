@@ -190,8 +190,6 @@ static void mmhub_v9_4_init_tlb_regs(struct amdgpu_device *adev, int hubid)
 	tmp = REG_SET_FIELD(tmp, VMSHAREDVC0_MC_VM_MX_L1_TLB_CNTL,
 			    SYSTEM_APERTURE_UNMAPPED_ACCESS, 0);
 	tmp = REG_SET_FIELD(tmp, VMSHAREDVC0_MC_VM_MX_L1_TLB_CNTL,
-			    ECO_BITS, 0);
-	tmp = REG_SET_FIELD(tmp, VMSHAREDVC0_MC_VM_MX_L1_TLB_CNTL,
 			    MTYPE, MTYPE_UC);/* XXX for emulation. */
 	tmp = REG_SET_FIELD(tmp, VMSHAREDVC0_MC_VM_MX_L1_TLB_CNTL,
 			    ATC_EN, 1);
@@ -297,8 +295,16 @@ static void mmhub_v9_4_disable_identity_aperture(struct amdgpu_device *adev,
 static void mmhub_v9_4_setup_vmid_config(struct amdgpu_device *adev, int hubid)
 {
 	struct amdgpu_vmhub *hub = &adev->vmhub[AMDGPU_MMHUB_0];
+	unsigned int num_level, block_size;
 	uint32_t tmp;
 	int i;
+
+	num_level = adev->vm_manager.num_level;
+	block_size = adev->vm_manager.block_size;
+	if (adev->gmc.translate_further)
+		num_level -= 1;
+	else
+		block_size -= 9;
 
 	for (i = 0; i <= 14; i++) {
 		tmp = RREG32_SOC15_OFFSET(MMHUB, 0, mmVML2VC0_VM_CONTEXT1_CNTL,
@@ -307,7 +313,7 @@ static void mmhub_v9_4_setup_vmid_config(struct amdgpu_device *adev, int hubid)
 				    ENABLE_CONTEXT, 1);
 		tmp = REG_SET_FIELD(tmp, VML2VC0_VM_CONTEXT1_CNTL,
 				    PAGE_TABLE_DEPTH,
-				    adev->vm_manager.num_level);
+				    num_level);
 		tmp = REG_SET_FIELD(tmp, VML2VC0_VM_CONTEXT1_CNTL,
 				    RANGE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
 		tmp = REG_SET_FIELD(tmp, VML2VC0_VM_CONTEXT1_CNTL,
@@ -325,7 +331,7 @@ static void mmhub_v9_4_setup_vmid_config(struct amdgpu_device *adev, int hubid)
 				    EXECUTE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
 		tmp = REG_SET_FIELD(tmp, VML2VC0_VM_CONTEXT1_CNTL,
 				    PAGE_TABLE_BLOCK_SIZE,
-				    adev->vm_manager.block_size - 9);
+				    block_size);
 		/* Send no-retry XNACK on fault to suppress VM fault storm. */
 		tmp = REG_SET_FIELD(tmp, VML2VC0_VM_CONTEXT1_CNTL,
 				    RETRY_PERMISSION_OR_INVALID_PAGE_FAULT,
@@ -562,7 +568,10 @@ static void mmhub_v9_4_update_medium_grain_clock_gating(struct amdgpu_device *ad
 					mmATCL2_0_ATC_L2_MISC_CG,
 					i * MMHUB_INSTANCE_REGISTER_OFFSET);
 
-		data &= ~ATCL2_0_ATC_L2_MISC_CG__ENABLE_MASK;
+		if (enable && (adev->cg_flags & AMD_CG_SUPPORT_MC_MGCG))
+			data |= ATCL2_0_ATC_L2_MISC_CG__ENABLE_MASK;
+		else
+			data &= ~ATCL2_0_ATC_L2_MISC_CG__ENABLE_MASK;
 
 		if (def != data)
 			WREG32_SOC15_OFFSET(MMHUB, 0, mmATCL2_0_ATC_L2_MISC_CG,
@@ -573,7 +582,25 @@ static void mmhub_v9_4_update_medium_grain_clock_gating(struct amdgpu_device *ad
 					mmDAGB0_CNTL_MISC2,
 					i * MMHUB_INSTANCE_REGISTER_OFFSET +
 					j * dist);
-				
+			if (enable &&
+			    (adev->cg_flags & AMD_CG_SUPPORT_MC_MGCG)) {
+				data1 &=
+				    ~(DAGB0_CNTL_MISC2__DISABLE_WRREQ_CG_MASK |
+				    DAGB0_CNTL_MISC2__DISABLE_WRRET_CG_MASK |
+				    DAGB0_CNTL_MISC2__DISABLE_RDREQ_CG_MASK |
+				    DAGB0_CNTL_MISC2__DISABLE_RDRET_CG_MASK |
+				    DAGB0_CNTL_MISC2__DISABLE_TLBWR_CG_MASK |
+				    DAGB0_CNTL_MISC2__DISABLE_TLBRD_CG_MASK);
+			} else {
+				data1 |=
+				    (DAGB0_CNTL_MISC2__DISABLE_WRREQ_CG_MASK |
+				    DAGB0_CNTL_MISC2__DISABLE_WRRET_CG_MASK |
+				    DAGB0_CNTL_MISC2__DISABLE_RDREQ_CG_MASK |
+				    DAGB0_CNTL_MISC2__DISABLE_RDRET_CG_MASK |
+				    DAGB0_CNTL_MISC2__DISABLE_TLBWR_CG_MASK |
+				    DAGB0_CNTL_MISC2__DISABLE_TLBRD_CG_MASK);
+			}
+
 			if (def1 != data1)
 				WREG32_SOC15_OFFSET(MMHUB, 0,
 					mmDAGB0_CNTL_MISC2,
@@ -597,7 +624,10 @@ static void mmhub_v9_4_update_medium_grain_light_sleep(struct amdgpu_device *ade
 					mmATCL2_0_ATC_L2_MISC_CG,
 					i * MMHUB_INSTANCE_REGISTER_OFFSET);
 
-		data &= ~ATCL2_0_ATC_L2_MISC_CG__MEM_LS_ENABLE_MASK;
+		if (enable && (adev->cg_flags & AMD_CG_SUPPORT_MC_LS))
+			data |= ATCL2_0_ATC_L2_MISC_CG__MEM_LS_ENABLE_MASK;
+		else
+			data &= ~ATCL2_0_ATC_L2_MISC_CG__MEM_LS_ENABLE_MASK;
 
 		if (def != data)
 			WREG32_SOC15_OFFSET(MMHUB, 0, mmATCL2_0_ATC_L2_MISC_CG,
@@ -625,7 +655,7 @@ static int mmhub_v9_4_set_clockgating(struct amdgpu_device *adev,
 	return 0;
 }
 
-static void mmhub_v9_4_get_clockgating(struct amdgpu_device *adev, u32 *flags)
+static void mmhub_v9_4_get_clockgating(struct amdgpu_device *adev, u64 *flags)
 {
 	int data, data1;
 
@@ -1633,12 +1663,16 @@ static void mmhub_v9_4_query_ras_error_status(struct amdgpu_device *adev)
 	}
 }
 
-const struct amdgpu_mmhub_ras_funcs mmhub_v9_4_ras_funcs = {
-	.ras_late_init = amdgpu_mmhub_ras_late_init,
-	.ras_fini = amdgpu_mmhub_ras_fini,
+const struct amdgpu_ras_block_hw_ops mmhub_v9_4_ras_hw_ops = {
 	.query_ras_error_count = mmhub_v9_4_query_ras_error_count,
 	.reset_ras_error_count = mmhub_v9_4_reset_ras_error_count,
 	.query_ras_error_status = mmhub_v9_4_query_ras_error_status,
+};
+
+struct amdgpu_mmhub_ras mmhub_v9_4_ras = {
+	.ras_block = {
+		.hw_ops = &mmhub_v9_4_ras_hw_ops,
+	},
 };
 
 const struct amdgpu_mmhub_funcs mmhub_v9_4_funcs = {

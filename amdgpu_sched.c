@@ -32,40 +32,13 @@
 #include "amdgpu_sched.h"
 #include "amdgpu_vm.h"
 
-int amdgpu_to_sched_priority(int amdgpu_priority,
-			     enum drm_sched_priority *prio)
-{
-	switch (amdgpu_priority) {
-	case AMDGPU_CTX_PRIORITY_VERY_HIGH:
-		*prio = DRM_SCHED_PRIORITY_HIGH;
-		break;
-	case AMDGPU_CTX_PRIORITY_HIGH:
-		*prio = DRM_SCHED_PRIORITY_HIGH;
-		break;
-	case AMDGPU_CTX_PRIORITY_NORMAL:
-		*prio = DRM_SCHED_PRIORITY_NORMAL;
-		break;
-	case AMDGPU_CTX_PRIORITY_LOW:
-	case AMDGPU_CTX_PRIORITY_VERY_LOW:
-		*prio = DRM_SCHED_PRIORITY_MIN;
-		break;
-	case AMDGPU_CTX_PRIORITY_UNSET:
-		*prio = DRM_SCHED_PRIORITY_UNSET;
-		break;
-	default:
-		WARN(1, "Invalid context priority %d\n", amdgpu_priority);
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
 static int amdgpu_sched_process_priority_override(struct amdgpu_device *adev,
 						  int fd,
-						  enum drm_sched_priority priority)
+						  int32_t priority)
 {
 	struct fd f = fdget(fd);
 	struct amdgpu_fpriv *fpriv;
+	struct amdgpu_ctx_mgr *mgr;
 	struct amdgpu_ctx *ctx;
 	uint32_t id;
 	int r;
@@ -79,8 +52,11 @@ static int amdgpu_sched_process_priority_override(struct amdgpu_device *adev,
 		return r;
 	}
 
-	idr_for_each_entry(&fpriv->ctx_mgr.ctx_handles, ctx, id)
+	mgr = &fpriv->ctx_mgr;
+	mutex_lock(&mgr->lock);
+	idr_for_each_entry(&mgr->ctx_handles, ctx, id)
 		amdgpu_ctx_priority_override(ctx, priority);
+	mutex_unlock(&mgr->lock);
 
 	fdput(f);
 	return 0;
@@ -89,13 +65,11 @@ static int amdgpu_sched_process_priority_override(struct amdgpu_device *adev,
 static int amdgpu_sched_context_priority_override(struct amdgpu_device *adev,
 						  int fd,
 						  unsigned ctx_id,
-						  enum drm_sched_priority priority,
-						  int ctx_priority)
+						  int32_t priority)
 {
 	struct fd f = fdget(fd);
 	struct amdgpu_fpriv *fpriv;
 	struct amdgpu_ctx *ctx;
-	struct amdgpu_sws_ctx *sws_ctx;
 	int r;
 
 	if (!f.file)
@@ -115,30 +89,6 @@ static int amdgpu_sched_context_priority_override(struct amdgpu_device *adev,
 	}
 
 	amdgpu_ctx_priority_override(ctx, priority);
-
-	if (ctx->cwsr && ctx->resv_ring
-	    && ctx_priority <= ctx->ctx_priority) {
-		sws_ctx = &ctx->resv_ring->sws_ctx;
-		switch (ctx_priority) {
-		case AMDGPU_CTX_PRIORITY_HIGH:
-			sws_ctx->priority = SWS_SCHED_PRIORITY_HIGH;
-			break;
-
-		case AMDGPU_CTX_PRIORITY_UNSET:
-		case AMDGPU_CTX_PRIORITY_NORMAL:
-			sws_ctx->priority = SWS_SCHED_PRIORITY_NORMAL;
-			break;
-
-		case AMDGPU_CTX_PRIORITY_LOW:
-		case AMDGPU_CTX_PRIORITY_VERY_LOW:
-			sws_ctx->priority = SWS_SCHED_PRIORITY_LOW;
-			break;
-
-		default:
-			break;
-		}
-	}
-
 	amdgpu_ctx_put(ctx);
 	fdput(f);
 
@@ -150,8 +100,6 @@ int amdgpu_sched_ioctl(struct drm_device *dev, void *data,
 {
 	union drm_amdgpu_sched *args = data;
 	struct amdgpu_device *adev = drm_to_adev(dev);
-	enum drm_sched_priority priority;
-	int ctx_priority;
 	int r;
 
 	/* First check the op, then the op's argument.
@@ -165,23 +113,22 @@ int amdgpu_sched_ioctl(struct drm_device *dev, void *data,
 		return -EINVAL;
 	}
 
-	ctx_priority = args->in.priority;
-	r = amdgpu_to_sched_priority(ctx_priority, &priority);
-	if (r)
-		return r;
+	if (!amdgpu_ctx_priority_is_valid(args->in.priority)) {
+		WARN(1, "Invalid context priority %d\n", args->in.priority);
+		return -EINVAL;
+	}
 
 	switch (args->in.op) {
 	case AMDGPU_SCHED_OP_PROCESS_PRIORITY_OVERRIDE:
 		r = amdgpu_sched_process_priority_override(adev,
 							   args->in.fd,
-							   priority);
+							   args->in.priority);
 		break;
 	case AMDGPU_SCHED_OP_CONTEXT_PRIORITY_OVERRIDE:
 		r = amdgpu_sched_context_priority_override(adev,
 							   args->in.fd,
 							   args->in.ctx_id,
-							   priority,
-							   ctx_priority);
+							   args->in.priority);
 		break;
 	default:
 		/* Impossible.

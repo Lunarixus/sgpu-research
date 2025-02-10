@@ -74,13 +74,12 @@ static int amdgpu_vm_cpu_update(struct amdgpu_vm_update_params *p,
 {
 	unsigned int i;
 	uint64_t value;
-	int r;
+	long r;
 
-	if (vmbo->bo.tbo.moving) {
-		r = dma_fence_wait(vmbo->bo.tbo.moving, true);
-		if (r)
-			return r;
-	}
+	r = dma_resv_wait_timeout(vmbo->bo.tbo.base.resv, DMA_RESV_USAGE_KERNEL,
+				  true, MAX_SCHEDULE_TIMEOUT);
+	if (r < 0)
+		return r;
 
 	pe += (unsigned long)amdgpu_bo_kptr(&vmbo->bo);
 
@@ -90,20 +89,10 @@ static int amdgpu_vm_cpu_update(struct amdgpu_vm_update_params *p,
 		value = p->pages_addr ?
 			amdgpu_vm_map_gart(p->pages_addr, addr) :
 			addr;
-
-		if (trace_amdgpu_vm_pte_pde_enabled() &&
-		    (incr != 0 || count == 1)) {
-			/* trace only valid pde and pte */
-			trace_amdgpu_vm_pte_pde(pe + i * 8, value, flags,
-						incr != 0 ? true : false);
-		}
 		amdgpu_gmc_set_pte_pde(p->adev, (void *)(uintptr_t)pe,
 				       i, value, flags);
 		addr += incr;
 	}
-
-	wmb();
-
 	return 0;
 }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017-2021 Advanced Micro Devices, Inc.
+ * Copyright 2017 Advanced Micro Devices, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -26,7 +26,6 @@
 #include <linux/types.h>
 #include <linux/mutex.h>
 #include <linux/list.h>
-#include <linux/idr.h>
 #include <linux/dma-fence.h>
 
 #include "amdgpu_sync.h"
@@ -48,7 +47,7 @@ struct amdgpu_vmid {
 
 	uint64_t		pd_gpu_addr;
 	/* last flushed PD/PT update */
-	struct dma_fence	*flushed_updates;
+	uint64_t		flushed_updates;
 
 	uint32_t                current_gpu_reset_count;
 
@@ -61,10 +60,6 @@ struct amdgpu_vmid {
 
 	unsigned		pasid;
 	struct dma_fence	*pasid_mapping;
-
-	bool                    reserved_range;
-	u32                     cwsr_vmid;
-	u32                     cwsr_idx;
 };
 
 struct amdgpu_vmid_mgr {
@@ -72,8 +67,6 @@ struct amdgpu_vmid_mgr {
 	unsigned		num_ids;
 	struct list_head	ids_lru;
 	struct amdgpu_vmid	ids[AMDGPU_NUM_VMID];
-	struct amdgpu_vmid	*cwsr_ids;
-	struct ida              cwsr_ida;
 	atomic_t		reserved_vmid_num;
 };
 
@@ -90,23 +83,6 @@ int amdgpu_vmid_alloc_reserved(struct amdgpu_device *adev,
 void amdgpu_vmid_free_reserved(struct amdgpu_device *adev,
 			       struct amdgpu_vm *vm,
 			       unsigned vmhub);
-
-void amdgpu_vmid_hide_id(struct amdgpu_device *adev,
-			 u32 vmhub,
-			 u32 idx);
-void amdgpu_vmid_unhide_id(struct amdgpu_device *adev,
-			   u32 vmhub,
-			   u32 idx);
-
-int amdgpu_vmid_alloc_reserved_range(struct amdgpu_device *adev,
-				     u32 vmhub, u32 start, u32 end);
-
-int amdgpu_vmid_free_reserved_range(struct amdgpu_device *adev,
-				    u32 vmhub, u32 start, u32 end);
-
-int amdgpu_vmid_cwsr_grab(struct amdgpu_device *adev,
-			  struct amdgpu_vmid **vmid);
-
 int amdgpu_vmid_grab(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
 		     struct amdgpu_sync *sync, struct dma_fence *fence,
 		     struct amdgpu_job *job);

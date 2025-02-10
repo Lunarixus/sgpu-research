@@ -26,9 +26,6 @@
 #include <drm/amdgpu_drm.h>
 #include <drm/drm_gem.h>
 
-#define AMDGPU_CREATE_BO     0
-#define AMDGPU_CLOSE_BO	     1
-
 /*
  * GEM.
  */
@@ -74,5 +71,4 @@ int amdgpu_gem_op_ioctl(struct drm_device *dev, void *data,
 int amdgpu_gem_metadata_ioctl(struct drm_device *dev, void *data,
 				struct drm_file *filp);
 
-int amdgpu_gem_bo_size(struct drm_gem_object *gobj, struct drm_file *file_priv, int flag);
 #endif

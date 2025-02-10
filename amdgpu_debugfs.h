@@ -22,7 +22,6 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  *
  */
-
 /*
  * Debugfs
  */
@@ -33,4 +32,3 @@ void amdgpu_debugfs_fini(struct amdgpu_device *adev);
 void amdgpu_debugfs_fence_init(struct amdgpu_device *adev);
 void amdgpu_debugfs_firmware_init(struct amdgpu_device *adev);
 void amdgpu_debugfs_gem_init(struct amdgpu_device *adev);
-int sgpu_debugfs_jobtimeout_to_panic_init(struct amdgpu_device *adev);

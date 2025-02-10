@@ -193,20 +193,7 @@ static irqreturn_t amdgpu_irq_handler(int irq, void *arg)
 	if (ret == IRQ_HANDLED)
 		pm_runtime_mark_last_busy(dev->dev);
 
-	/* For the hardware that cannot enable bif ring for both ras_controller_irq
-         * and ras_err_evnet_athub_irq ih cookies, the driver has to poll status
-	 * register to check whether the interrupt is triggered or not, and properly
-	 * ack the interrupt if it is there
-	 */
-	if (amdgpu_ras_is_supported(adev, AMDGPU_RAS_BLOCK__PCIE_BIF)) {
-		if (adev->nbio.ras_funcs &&
-		    adev->nbio.ras_funcs->handle_ras_controller_intr_no_bifring)
-			adev->nbio.ras_funcs->handle_ras_controller_intr_no_bifring(adev);
-
-		if (adev->nbio.ras_funcs &&
-		    adev->nbio.ras_funcs->handle_ras_err_event_athub_intr_no_bifring)
-			adev->nbio.ras_funcs->handle_ras_err_event_athub_intr_no_bifring(adev);
-	}
+	amdgpu_ras_interrupt_fatal_error_handler(adev);
 
 	return ret;
 }
@@ -269,8 +256,6 @@ static void amdgpu_irq_handle_ih_soft(struct work_struct *work)
  */
 static bool amdgpu_msi_ok(struct amdgpu_device *adev)
 {
-	if (!adev->pdev)
-		return false;
 	if (amdgpu_msi == 1)
 		return true;
 	else if (amdgpu_msi == 0)
@@ -308,20 +293,7 @@ static void amdgpu_restore_msix(struct amdgpu_device *adev)
 int amdgpu_irq_init(struct amdgpu_device *adev)
 {
 	int r = 0;
-	unsigned int irq, afm_irq;
-
-	if (adev->pldev) {
-		irq = platform_get_irq(adev->pldev, 0);
-		DRM_INFO("irq number: %d\n", irq);
-		if (irq < 0)
-			return irq;
-		/* afm interrupt set */
-		afm_irq = platform_get_irq(adev->pldev, 1);
-		DRM_INFO("afm irq number: %d\n", afm_irq);
-		if (afm_irq < 0)
-			return afm_irq;
-		adev->afm_irq = afm_irq;
-	}
+	unsigned int irq;
 
 	spin_lock_init(&adev->irq.lock);
 
@@ -332,8 +304,7 @@ int amdgpu_irq_init(struct amdgpu_device *adev)
 		int nvec = pci_msix_vec_count(adev->pdev);
 		unsigned int flags;
 
-		/* Only MSI is supported on Gopher */
-		if (amdgpu_emu_mode || nvec <= 0) {
+		if (nvec <= 0) {
 			flags = PCI_IRQ_MSI;
 		} else {
 			flags = PCI_IRQ_MSI | PCI_IRQ_MSIX;
@@ -365,6 +336,12 @@ int amdgpu_irq_init(struct amdgpu_device *adev)
 	INIT_WORK(&adev->irq.ih2_work, amdgpu_irq_handle_ih2);
 	INIT_WORK(&adev->irq.ih_soft_work, amdgpu_irq_handle_ih_soft);
 
+	/* Use vector 0 for MSI-X. */
+	r = pci_irq_vector(adev->pdev, 0);
+	if (r < 0)
+		return r;
+	irq = r;
+
 	/* PCI devices require shared interrupts. */
 	r = request_irq(irq, amdgpu_irq_handler, IRQF_SHARED, adev_to_drm(adev)->driver->name,
 			adev_to_drm(adev));
@@ -373,7 +350,6 @@ int amdgpu_irq_init(struct amdgpu_device *adev)
 			flush_work(&adev->hotplug_work);
 		return r;
 	}
-
 	adev->irq.installed = true;
 	adev->irq.irq = irq;
 	adev_to_drm(adev)->max_vblank_count = 0x00ffffff;
@@ -402,7 +378,7 @@ void amdgpu_irq_fini_hw(struct amdgpu_device *adev)
 }
 
 /**
- * amdgpu_irq_fini - shut down interrupt handling
+ * amdgpu_irq_fini_sw - shut down interrupt handling
  *
  * @adev: amdgpu device pointer
  *
@@ -540,6 +516,9 @@ void amdgpu_irq_dispatch(struct amdgpu_device *adev,
 	/* Send it to amdkfd as well if it isn't already handled */
 	if (!handled)
 		amdgpu_amdkfd_interrupt(adev, entry.iv_entry);
+
+	if (amdgpu_ih_ts_after(ih->processed_timestamp, entry.timestamp))
+		ih->processed_timestamp = entry.timestamp;
 }
 
 /**
@@ -672,6 +651,9 @@ int amdgpu_irq_put(struct amdgpu_device *adev, struct amdgpu_irq_src *src,
 		return -EINVAL;
 
 	if (!src->enabled_types || !src->funcs->set)
+		return -EINVAL;
+
+	if (WARN_ON(!amdgpu_irq_enabled(adev, src, type)))
 		return -EINVAL;
 
 	if (atomic_dec_and_test(&src->enabled_types[type]))

@@ -24,20 +24,6 @@
 #ifndef __GFX_V10_0_H__
 #define __GFX_V10_0_H__
 
-struct gc_down_config {
-	enum eval_mode_config       config_mode;
-	bool                        change_adapter_info;
-	u32                         wgps_per_sa;
-	u32                         rbs_per_sa;
-	u32                         se_count;
-	u32                         sas_per_se;
-	u32                         packers_per_sc;
-	u32                         num_scs;
-	bool                        write_shader_array_config;
-	bool                        use_reset_lowest_vgt_fw;
-	bool                        force_gl1_miss;
-};
-
 extern const struct amdgpu_ip_block_version gfx_v10_0_ip_block;
 
 #endif

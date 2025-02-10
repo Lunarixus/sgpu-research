@@ -45,6 +45,7 @@
 #include "cik_sdma.h"
 #include "uvd_v4_2.h"
 #include "vce_v2_0.h"
+#include "cik_dpm.h"
 
 #include "uvd/uvd_4_2_d.h"
 
@@ -1379,6 +1380,7 @@ static bool cik_asic_supports_baco(struct amdgpu_device *adev)
 	switch (adev->asic_type) {
 	case CHIP_BONAIRE:
 	case CHIP_HAWAII:
+		return amdgpu_dpm_is_baco_supported(adev);
 	default:
 		return false;
 	}
@@ -1426,8 +1428,13 @@ static int cik_asic_reset(struct amdgpu_device *adev)
 {
 	int r;
 
+	/* APUs don't have full asic reset */
+	if (adev->flags & AMD_IS_APU)
+		return 0;
+
 	if (cik_asic_reset_method(adev) == AMD_RESET_METHOD_BACO) {
 		dev_info(adev->dev, "BACO reset\n");
+		r = amdgpu_dpm_baco_reset(adev);
 	} else {
 		dev_info(adev->dev, "PCI CONFIG reset\n");
 		r = cik_asic_pci_config_reset(adev);
@@ -1712,7 +1719,7 @@ static void cik_program_aspm(struct amdgpu_device *adev)
 	bool disable_l0s = false, disable_l1 = false, disable_plloff_in_l1 = false;
 	bool disable_clkreq = false;
 
-	if (amdgpu_aspm == 0)
+	if (!amdgpu_device_should_use_aspm(adev))
 		return;
 
 	if (pci_is_root_bus(adev->pdev->bus))
