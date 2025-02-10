@@ -1,5 +1,5 @@
 /*
- * Copyright 2018-2021 Advanced Micro Devices, Inc.
+ * Copyright 2018 Advanced Micro Devices, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -30,6 +30,7 @@ struct drm_file;
 struct amdgpu_fpriv;
 
 #define AMDGPU_MAX_ENTITY_NUM 4
+#define AMDGPU_CTX_FENCE_USAGE_MIN_RATIO(max, total) ((max) > 16384ULL*(total))
 
 struct amdgpu_ctx_entity {
 	uint64_t		sequence;
@@ -45,35 +46,13 @@ struct amdgpu_ctx {
 	uint32_t			vram_lost_counter;
 	spinlock_t			ring_lock;
 	struct amdgpu_ctx_entity	*entities[AMDGPU_HW_IP_NUM][AMDGPU_MAX_ENTITY_NUM];
-	struct amdgpu_ctx_entity        *priv_entities; /* tmz and cwsr */
 	bool				preamble_presented;
 	enum drm_sched_priority		init_priority;
 	enum drm_sched_priority		override_priority;
-	int				ctx_priority;
 	struct mutex			lock;
 	atomic_t			guilty;
 	unsigned long			ras_counter_ce;
 	unsigned long			ras_counter_ue;
-	bool                            ifh_mode;
-	bool                            secure_mode;
-	struct amdgpu_fpriv             *fpriv;
-
-	/* Perfcounter active in rings*/
-	u32         pc_gfx_rings;
-	u32         pc_compute_rings;
-	/* SQ Thread Trace active in rings */
-	u32         sqtt_gfx_rings;
-	u32         sqtt_compute_rings;
-
-	bool                            cwsr; //cwsr is ready for this context
-	bool                            cwsr_init;
-	bool                            tmz; //TMZ res is ready
-
-	/* reused by cwsr and tmz for res in reserved kmd VM */
-	struct amdgpu_ring              *resv_ring;
-	u32                             resv_slot_idx;
-
-	u64				mem_size;
 };
 
 struct amdgpu_ctx_mgr {
@@ -109,5 +88,6 @@ void amdgpu_ctx_mgr_init(struct amdgpu_ctx_mgr *mgr);
 void amdgpu_ctx_mgr_entity_fini(struct amdgpu_ctx_mgr *mgr);
 long amdgpu_ctx_mgr_entity_flush(struct amdgpu_ctx_mgr *mgr, long timeout);
 void amdgpu_ctx_mgr_fini(struct amdgpu_ctx_mgr *mgr);
-
+ktime_t amdgpu_ctx_mgr_fence_usage(struct amdgpu_ctx_mgr *mgr, uint32_t hwip,
+		uint32_t idx, uint64_t *elapsed);
 #endif

@@ -125,20 +125,15 @@ int amdgpu_gfx_rlc_init_sr(struct amdgpu_device *adev, u32 dws)
 int amdgpu_gfx_rlc_init_csb(struct amdgpu_device *adev)
 {
 	u32 dws;
-	u32 domain;
 	int r;
-
-	if (amdgpu_force_gtt)
-		domain = AMDGPU_GEM_DOMAIN_GTT;
-	else
-		domain = AMDGPU_GEM_DOMAIN_VRAM;
 
 	/* allocate clear state block */
 	adev->gfx.rlc.clear_state_size = dws = adev->gfx.rlc.funcs->get_csb_size(adev);
-	r = amdgpu_bo_create_kernel(adev, dws * 4, PAGE_SIZE, domain,
-				    &adev->gfx.rlc.clear_state_obj,
-				    &adev->gfx.rlc.clear_state_gpu_addr,
-				    (void **)&adev->gfx.rlc.cs_ptr);
+	r = amdgpu_bo_create_kernel(adev, dws * 4, PAGE_SIZE,
+				      AMDGPU_GEM_DOMAIN_VRAM,
+				      &adev->gfx.rlc.clear_state_obj,
+				      &adev->gfx.rlc.clear_state_gpu_addr,
+				      (void **)&adev->gfx.rlc.cs_ptr);
 	if (r) {
 		dev_err(adev->dev, "(%d) failed to create rlc csb bo\n", r);
 		amdgpu_gfx_rlc_fini(adev);
@@ -159,15 +154,9 @@ int amdgpu_gfx_rlc_init_csb(struct amdgpu_device *adev)
 int amdgpu_gfx_rlc_init_cpt(struct amdgpu_device *adev)
 {
 	int r;
-	u32 domain;
-
-	if (amdgpu_force_gtt)
-		domain = AMDGPU_GEM_DOMAIN_GTT;
-	else
-		domain = AMDGPU_GEM_DOMAIN_VRAM;
 
 	r = amdgpu_bo_create_reserved(adev, adev->gfx.rlc.cp_table_size,
-				      PAGE_SIZE, domain,
+				      PAGE_SIZE, AMDGPU_GEM_DOMAIN_VRAM,
 				      &adev->gfx.rlc.cp_table_obj,
 				      &adev->gfx.rlc.cp_table_gpu_addr,
 				      (void **)&adev->gfx.rlc.cp_table_ptr);

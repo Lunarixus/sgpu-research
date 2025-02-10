@@ -1,5 +1,5 @@
 /*
- * Copyright 2008-2020 Advanced Micro Devices, Inc.
+ * Copyright 2008 Advanced Micro Devices, Inc.
  * Copyright 2008 Red Hat Inc.
  * Copyright 2009 Jerome Glisse.
  *
@@ -34,7 +34,6 @@
 #include <drm/amdgpu_drm.h>
 #include "amdgpu.h"
 #include "atom.h"
-#include "amdgpu_cwsr.h"
 
 /*
  * Rings
@@ -53,7 +52,6 @@
 /**
  * amdgpu_ring_alloc - allocate space on the ring buffer
  *
- * @adev: amdgpu_device pointer
  * @ring: amdgpu_ring structure holding ring information
  * @ndw: number of dwords to allocate in the ring buffer
  *
@@ -96,7 +94,8 @@ void amdgpu_ring_insert_nop(struct amdgpu_ring *ring, uint32_t count)
 		amdgpu_ring_write(ring, ring->funcs->nop);
 }
 
-/** amdgpu_ring_generic_pad_ib - pad IB with NOP packets
+/**
+ * amdgpu_ring_generic_pad_ib - pad IB with NOP packets
  *
  * @ring: amdgpu_ring structure holding ring information
  * @ib: IB to add NOP packets to
@@ -113,7 +112,6 @@ void amdgpu_ring_generic_pad_ib(struct amdgpu_ring *ring, struct amdgpu_ib *ib)
  * amdgpu_ring_commit - tell the GPU to execute the new
  * commands on the ring buffer
  *
- * @adev: amdgpu_device pointer
  * @ring: amdgpu_ring structure holding ring information
  *
  * Update the wptr (write pointer) to tell the GPU to
@@ -156,15 +154,19 @@ void amdgpu_ring_undo(struct amdgpu_ring *ring)
  *
  * @adev: amdgpu_device pointer
  * @ring: amdgpu_ring structure holding ring information
- * @max_ndw: maximum number of dw for ring alloc
- * @nop: nop packet for this ring
+ * @max_dw: maximum number of dw for ring alloc
+ * @irq_src: interrupt source to use for this ring
+ * @irq_type: interrupt type to use for this ring
+ * @hw_prio: ring priority (NORMAL/HIGH)
+ * @sched_score: optional score atomic shared with other schedulers
  *
  * Initialize the driver information for the selected ring (all asics).
  * Returns 0 on success, error on failure.
  */
 int amdgpu_ring_init(struct amdgpu_device *adev, struct amdgpu_ring *ring,
 		     unsigned int max_dw, struct amdgpu_irq_src *irq_src,
-		     unsigned int irq_type, unsigned int hw_prio)
+		     unsigned int irq_type, unsigned int hw_prio,
+		     atomic_t *sched_score)
 {
 	int r;
 	int sched_hw_submission = amdgpu_sched_hw_submission;
@@ -189,7 +191,8 @@ int amdgpu_ring_init(struct amdgpu_device *adev, struct amdgpu_ring *ring,
 		ring->adev = adev;
 		ring->idx = adev->num_rings++;
 		adev->rings[ring->idx] = ring;
-		r = amdgpu_fence_driver_init_ring(ring, sched_hw_submission);
+		r = amdgpu_fence_driver_init_ring(ring, sched_hw_submission,
+						  sched_score);
 		if (r)
 			return r;
 	}
@@ -258,26 +261,14 @@ int amdgpu_ring_init(struct amdgpu_device *adev, struct amdgpu_ring *ring,
 	}
 
 	ring->max_dw = max_dw;
-	ring->priority = DRM_SCHED_PRIORITY_NORMAL;
-	mutex_init(&ring->priority_mutex);
+	ring->hw_prio = hw_prio;
 
 	if (!ring->no_scheduler) {
 		hw_ip = ring->funcs->type;
-
-		/* Do not assign scheduler attached to Ring0 on the basis of
-		 * priority. Ring0 is reserved for ACE tunnel and scheduler
-		 * attached to Ring0 will be assigned on the basis of ctx
-		 * priority.
-		 */
-		if (!(hw_ip == AMDGPU_HW_IP_COMPUTE && ring->me == 1 &&
-		      ring->pipe == 0 && ring->queue == 0)) {
-			num_sched = &adev->gpu_sched[hw_ip][hw_prio].num_scheds;
-			adev->gpu_sched[hw_ip][hw_prio].sched[(*num_sched)++] =
-				&ring->sched;
-		}
+		num_sched = &adev->gpu_sched[hw_ip][hw_prio].num_scheds;
+		adev->gpu_sched[hw_ip][hw_prio].sched[(*num_sched)++] =
+			&ring->sched;
 	}
-
-	atomic_set(&ring->num_jobs, 0);
 
 	return 0;
 }
@@ -285,7 +276,6 @@ int amdgpu_ring_init(struct amdgpu_device *adev, struct amdgpu_ring *ring,
 /**
  * amdgpu_ring_fini - tear down the driver ring struct.
  *
- * @adev: amdgpu_device pointer
  * @ring: amdgpu_ring structure holding ring information
  *
  * Tear down the driver information for the selected ring (all asics).
@@ -319,7 +309,7 @@ void amdgpu_ring_fini(struct amdgpu_ring *ring)
 /**
  * amdgpu_ring_emit_reg_write_reg_wait_helper - ring helper
  *
- * @adev: amdgpu_device pointer
+ * @ring: ring to write to
  * @reg0: register to write
  * @reg1: register to wait on
  * @ref: reference value to write/wait on
@@ -350,8 +340,7 @@ bool amdgpu_ring_soft_recovery(struct amdgpu_ring *ring, unsigned int vmid,
 {
 	ktime_t deadline = ktime_add_us(ktime_get(), 10000);
 
-	if (amdgpu_sriov_vf(ring->adev) || !ring->funcs->soft_recovery || !fence ||
-	    !amdgpu_gpu_recovery)
+	if (amdgpu_sriov_vf(ring->adev) || !ring->funcs->soft_recovery || !fence)
 		return false;
 
 	atomic_inc(&ring->adev->gpu_reset_counter);
@@ -406,7 +395,7 @@ static ssize_t amdgpu_debugfs_ring_read(struct file *f, char __user *buf,
 			return result;
 
 		value = ring->ring[(*pos - 12)/4];
-		r = put_user(value, (uint32_t*)buf);
+		r = put_user(value, (uint32_t *)buf);
 		if (r)
 			return r;
 		buf += 4;
@@ -418,74 +407,10 @@ static ssize_t amdgpu_debugfs_ring_read(struct file *f, char __user *buf,
 	return result;
 }
 
-ssize_t amdgpu_debugfs_ring_write(struct file *file,
-				  const char __user *buf,
-				  size_t len, loff_t *ppos)
-{
-	struct amdgpu_ring *ring = file_inode(file)->i_private;
-	char local_buf[256];
-	size_t size;
-	int r = 0;
-	u32 val;
-
-	if (!ring || !ring->cwsr) {
-		DRM_INFO("current ring can not support dequeue and relaunch\n");
-		return len;
-	}
-
-	size = min(sizeof(local_buf) - 1, len);
-	if (copy_from_user(local_buf, buf, size)) {
-		DRM_WARN("failed to copy buf from user space\n");
-		return len;
-	}
-
-	local_buf[size] = '\0';
-	r = kstrtou32(local_buf, 0, &val);
-	if (r)
-		return r;
-
-	//1: dequeue; 2: re-launch; 3: dequeue, sleep 1 second and relaunch
-	switch (val) {
-	case 1:
-		r = amdgpu_cwsr_dequeue(ring);
-		break;
-
-	case 2:
-		r = amdgpu_cwsr_relaunch(ring);
-		break;
-
-	case 3:
-		r = amdgpu_cwsr_dequeue(ring);
-		if (r)
-			break;
-
-		msleep(1000);
-		r = amdgpu_cwsr_relaunch(ring);
-		break;
-
-	default:
-		DRM_WARN("command is not supported\n");
-	}
-
-	if (r == 0)
-		r = len;
-	return r;
-}
-
-int local_release(struct inode *inode, struct file *file)
-{
-	struct amdgpu_ring *ring = file_inode(file)->i_private;
-
-	i_size_write(inode, ring->ring_size + 12);
-	return 0;
-}
-
 static const struct file_operations amdgpu_debugfs_ring_fops = {
 	.owner = THIS_MODULE,
 	.read = amdgpu_debugfs_ring_read,
-	.write   = amdgpu_debugfs_ring_write,
-	.llseek = default_llseek,
-	.release = local_release,
+	.llseek = default_llseek
 };
 
 #endif
@@ -503,20 +428,13 @@ int amdgpu_debugfs_ring_init(struct amdgpu_device *adev,
 	ent = debugfs_create_file(name,
 				  S_IFREG | S_IRUGO, root,
 				  ring, &amdgpu_debugfs_ring_fops);
-	if (!ent)
-		return -ENOMEM;
+	if (IS_ERR(ent))
+		return PTR_ERR(ent);
 
 	i_size_write(ent->d_inode, ring->ring_size + 12);
 	ring->ent = ent;
 #endif
 	return 0;
-}
-
-void amdgpu_debugfs_ring_fini(struct amdgpu_ring *ring)
-{
-#if defined(CONFIG_DEBUG_FS)
-	debugfs_remove(ring->ent);
-#endif
 }
 
 /**
@@ -533,16 +451,13 @@ int amdgpu_ring_test_helper(struct amdgpu_ring *ring)
 	struct amdgpu_device *adev = ring->adev;
 	int r;
 
-	if (sgpu_no_hw_access != 0)
-		return 0;
-
 	r = amdgpu_ring_test_ring(ring);
 	if (r)
 		DRM_DEV_ERROR(adev->dev, "ring %s test failed (%d)\n",
 			      ring->name, r);
 	else
 		DRM_DEV_DEBUG(adev->dev, "ring test on %s succeeded\n",
-			     ring->name);
+			      ring->name);
 
 	ring->sched.ready = !r;
 	return r;

@@ -1,5 +1,5 @@
 /*
- * Copyright 2019-2021 Advanced Micro Devices, Inc.
+ * Copyright 2019 Advanced Micro Devices, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -26,11 +26,7 @@
 #include "amdgpu_atomfirmware.h"
 #include "gmc_v10_0.h"
 #include "umc_v8_7.h"
-#include <linux/pm_runtime.h>
 
-#include "hdp/hdp_5_0_0_offset.h"
-#include "hdp/hdp_5_0_0_sh_mask.h"
-#include "gc/gc_10_4_0_sh_mask.h"
 #include "athub/athub_2_0_0_sh_mask.h"
 #include "athub/athub_2_0_0_offset.h"
 #include "dcn/dcn_2_0_0_offset.h"
@@ -48,9 +44,9 @@
 #include "gfxhub_v2_0.h"
 #include "gfxhub_v2_1.h"
 #include "mmhub_v2_0.h"
+#include "mmhub_v2_3.h"
 #include "athub_v2_0.h"
 #include "athub_v2_1.h"
-#include "amdgpu_cwsr.h"
 
 #if 0
 static const struct soc15_reg_golden golden_settings_navi10_hdp[] =
@@ -75,17 +71,13 @@ gmc_v10_0_vm_fault_interrupt_state(struct amdgpu_device *adev,
 	switch (state) {
 	case AMDGPU_IRQ_STATE_DISABLE:
 		/* MM HUB */
-		if (adev->asic_type != CHIP_VANGOGH_LITE)
-			amdgpu_gmc_set_vm_fault_masks(adev,
-						      AMDGPU_MMHUB_0, false);
+		amdgpu_gmc_set_vm_fault_masks(adev, AMDGPU_MMHUB_0, false);
 		/* GFX HUB */
 		amdgpu_gmc_set_vm_fault_masks(adev, AMDGPU_GFXHUB_0, false);
 		break;
 	case AMDGPU_IRQ_STATE_ENABLE:
 		/* MM HUB */
-		if (adev->asic_type != CHIP_VANGOGH_LITE)
-			amdgpu_gmc_set_vm_fault_masks(adev,
-						      AMDGPU_MMHUB_0, true);
+		amdgpu_gmc_set_vm_fault_masks(adev, AMDGPU_MMHUB_0, true);
 		/* GFX HUB */
 		amdgpu_gmc_set_vm_fault_masks(adev, AMDGPU_GFXHUB_0, true);
 		break;
@@ -96,20 +88,43 @@ gmc_v10_0_vm_fault_interrupt_state(struct amdgpu_device *adev,
 	return 0;
 }
 
-#if IS_ENABLED(CONFIG_SEC_ABC)
-#include <linux/sti/abc_common.h>
-#endif
-
 static int gmc_v10_0_process_interrupt(struct amdgpu_device *adev,
 				       struct amdgpu_irq_src *source,
 				       struct amdgpu_iv_entry *entry)
 {
+	bool retry_fault = !!(entry->src_data[1] & 0x80);
+	bool write_fault = !!(entry->src_data[1] & 0x20);
 	struct amdgpu_vmhub *hub = &adev->vmhub[entry->vmid_src];
+	struct amdgpu_task_info task_info;
 	uint32_t status = 0;
 	u64 addr;
 
 	addr = (u64)entry->src_data[0] << 12;
 	addr |= ((u64)entry->src_data[1] & 0xf) << 44;
+
+	if (retry_fault) {
+		/* Returning 1 here also prevents sending the IV to the KFD */
+
+		/* Process it onyl if it's the first fault for this address */
+		if (entry->ih != &adev->irq.ih_soft &&
+		    amdgpu_gmc_filter_faults(adev, addr, entry->pasid,
+					     entry->timestamp))
+			return 1;
+
+		/* Delegate it to a different ring if the hardware hasn't
+		 * already done it.
+		 */
+		if (entry->ih == &adev->irq.ih) {
+			amdgpu_irq_delegate(adev, entry, 8);
+			return 1;
+		}
+
+		/* Try to handle the recoverable page faults by filling page
+		 * tables
+		 */
+		if (amdgpu_vm_handle_fault(adev, entry->pasid, addr, write_fault))
+			return 1;
+	}
 
 	if (!amdgpu_sriov_vf(adev)) {
 		/*
@@ -117,60 +132,34 @@ static int gmc_v10_0_process_interrupt(struct amdgpu_device *adev,
 		 * be updated to avoid reading an incorrect value due to
 		 * the new fast GRBM interface.
 		 */
-		if (entry->vmid_src == AMDGPU_GFXHUB_0)
+		if ((entry->vmid_src == AMDGPU_GFXHUB_0) &&
+		    (adev->asic_type < CHIP_SIENNA_CICHLID))
 			RREG32(hub->vm_l2_pro_fault_status);
 
 		status = RREG32(hub->vm_l2_pro_fault_status);
 		WREG32_P(hub->vm_l2_pro_fault_cntl, 1, ~1);
 	}
 
-	if (printk_ratelimit()) {
-		struct amdgpu_task_info task_info;
-		uint32_t pasid = entry->pasid;
+	if (!printk_ratelimit())
+		return 0;
 
-		if (pasid == 0 && entry->vmid_src < adev->num_vmhubs &&
-		    entry->vmid < AMDGPU_NUM_VMID) {
-			struct amdgpu_vmid_mgr *id_mgr =
-				&adev->vm_manager.id_mgr[entry->vmid_src];
-			pasid = id_mgr->ids[entry->vmid].pasid;
+	memset(&task_info, 0, sizeof(struct amdgpu_task_info));
+	amdgpu_vm_get_task_info(adev, entry->pasid, &task_info);
 
-			dev_err(adev->dev, "[%s] pasid parsing with vmid %u\n",
-				entry->vmid_src ? "mmhub" : "gfxhub",
-				entry->vmid);
-		}
+	dev_err(adev->dev,
+		"[%s] page fault (src_id:%u ring:%u vmid:%u pasid:%u, "
+		"for process %s pid %d thread %s pid %d)\n",
+		entry->vmid_src ? "mmhub" : "gfxhub",
+		entry->src_id, entry->ring_id, entry->vmid,
+		entry->pasid, task_info.process_name, task_info.tgid,
+		task_info.task_name, task_info.pid);
+	dev_err(adev->dev, "  in page starting at address 0x%016llx from client 0x%x (%s)\n",
+		addr, entry->client_id,
+		soc15_ih_clientid_name[entry->client_id]);
 
-		memset(&task_info, 0, sizeof(struct amdgpu_task_info));
-		amdgpu_vm_get_task_info(adev, pasid, &task_info);
-
-		dev_err(adev->dev,
-			"[%s] page fault (src_id:%u ring:%u vmid:%u pasid:%u, "
-			"for process %s pid %d thread %s pid %d)\n",
-			entry->vmid_src ? "mmhub" : "gfxhub",
-			entry->src_id, entry->ring_id, entry->vmid,
-			pasid, task_info.process_name, task_info.tgid,
-			task_info.task_name, task_info.pid);
-		dev_err(adev->dev, "  in page starting at address 0x%016llx from client %d\n",
-			addr, entry->client_id);
-		SGPU_LOG(adev, DMSG_INFO, DMSG_ETC,
-				"[%s] page fault (src_id:%u ring:%u vmid:%u pasid:%u, for process %s pid %d thread %s pid %d)\n",
-				entry->vmid_src ? "mmhub" : "gfxhub",
-				entry->src_id, entry->ring_id, entry->vmid,
-				pasid, task_info.process_name, task_info.tgid,
-				task_info.task_name, task_info.pid);
-
-		if (!amdgpu_sriov_vf(adev))
-			hub->vmhub_funcs->print_l2_protection_fault_status(adev, status);
-	}
-#if IS_ENABLED(CONFIG_SEC_ABC)
-		sec_abc_send_event("MODULE=gpu@WARN=gpu_fault");
-#endif
-
-
-	/* page_faulted_vmid setting for skipping resubmit */
-	adev->page_faulted_vmid = entry->vmid;
-	DRM_INFO("page_faulted_vmid %d set\n", entry->vmid);
-	if (adev->runpm)
-		pm_runtime_get_noresume(adev->ddev.dev);
+	if (!amdgpu_sriov_vf(adev))
+		hub->vmhub_funcs->print_l2_protection_fault_status(adev,
+								   status);
 
 	return 0;
 }
@@ -185,7 +174,7 @@ static const struct amdgpu_irq_src_funcs gmc_v10_0_ecc_funcs = {
 	.process = amdgpu_umc_process_ecc_irq,
 };
 
- static void gmc_v10_0_set_irq_funcs(struct amdgpu_device *adev)
+static void gmc_v10_0_set_irq_funcs(struct amdgpu_device *adev)
 {
 	adev->gmc.vm_fault.num_types = 1;
 	adev->gmc.vm_fault.funcs = &gmc_v10_0_irq_funcs;
@@ -236,22 +225,16 @@ static void gmc_v10_0_flush_vm_hub(struct amdgpu_device *adev, uint32_t vmid,
 {
 	bool use_semaphore = gmc_v10_0_use_invalidate_semaphore(adev, vmhub);
 	struct amdgpu_vmhub *hub = &adev->vmhub[vmhub];
-	u32 inv_req;
+	u32 inv_req = hub->vmhub_funcs->get_invalidate_req(vmid, flush_type);
 	u32 tmp;
 	/* Use register 17 for GART */
 	const unsigned eng = 17;
 	unsigned int i;
+	unsigned char hub_ip = 0;
 
-	if (sgpu_no_hw_access != 0)
-		return;
+	hub_ip = (vmhub == AMDGPU_GFXHUB_0) ?
+		   GC_HWIP : MMHUB_HWIP;
 
-	if ((vmhub == AMDGPU_MMHUB_0 || vmhub == AMDGPU_MMHUB_1) &&
-	    adev->asic_type == CHIP_VANGOGH_LITE) {
-		DRM_INFO("Skip %s for MMHUB!\n", __func__);
-		return;
-	}
-
-	inv_req = hub->vmhub_funcs->get_invalidate_req(vmid, flush_type);
 	spin_lock(&adev->gmc.invalidate_lock);
 	/*
 	 * It may lose gpuvm invalidate acknowldege state across power-gating
@@ -264,8 +247,9 @@ static void gmc_v10_0_flush_vm_hub(struct amdgpu_device *adev, uint32_t vmid,
 	if (use_semaphore) {
 		for (i = 0; i < adev->usec_timeout; i++) {
 			/* a read return value of 1 means semaphore acuqire */
-			tmp = RREG32_NO_KIQ(hub->vm_inv_eng0_sem +
-					    hub->eng_distance * eng);
+			tmp = RREG32_RLC_NO_KIQ(hub->vm_inv_eng0_sem +
+					 hub->eng_distance * eng, hub_ip);
+
 			if (tmp & 0x1)
 				break;
 			udelay(1);
@@ -275,27 +259,29 @@ static void gmc_v10_0_flush_vm_hub(struct amdgpu_device *adev, uint32_t vmid,
 			DRM_ERROR("Timeout waiting for sem acquire in VM flush!\n");
 	}
 
-	WREG32_NO_KIQ(hub->vm_inv_eng0_req + hub->eng_distance * eng, inv_req);
+	WREG32_RLC_NO_KIQ(hub->vm_inv_eng0_req +
+			  hub->eng_distance * eng,
+			  inv_req, hub_ip);
 
 	/*
 	 * Issue a dummy read to wait for the ACK register to be cleared
 	 * to avoid a false ACK due to the new fast GRBM interface.
 	 */
-	if (vmhub == AMDGPU_GFXHUB_0)
-		RREG32_NO_KIQ(hub->vm_inv_eng0_req + hub->eng_distance * eng);
+	if ((vmhub == AMDGPU_GFXHUB_0) &&
+	    (adev->asic_type < CHIP_SIENNA_CICHLID))
+		RREG32_RLC_NO_KIQ(hub->vm_inv_eng0_req +
+				  hub->eng_distance * eng, hub_ip);
 
 	/* Wait for ACK with a delay.*/
 	for (i = 0; i < adev->usec_timeout; i++) {
-		tmp = RREG32_NO_KIQ(hub->vm_inv_eng0_ack +
-				    hub->eng_distance * eng);
+		tmp = RREG32_RLC_NO_KIQ(hub->vm_inv_eng0_ack +
+				  hub->eng_distance * eng, hub_ip);
+
 		tmp &= 1 << vmid;
 		if (tmp)
 			break;
 
-		if (!amdgpu_emu_mode)
-			udelay(1);
-		else
-			mdelay(1);
+		udelay(1);
 	}
 
 	/* TODO: It needs to continue working on debugging with semaphore for GFXHUB as well. */
@@ -304,15 +290,15 @@ static void gmc_v10_0_flush_vm_hub(struct amdgpu_device *adev, uint32_t vmid,
 		 * add semaphore release after invalidation,
 		 * write with 0 means semaphore release
 		 */
-		WREG32_NO_KIQ(hub->vm_inv_eng0_sem +
-			      hub->eng_distance * eng, 0);
+		WREG32_RLC_NO_KIQ(hub->vm_inv_eng0_sem +
+				  hub->eng_distance * eng, 0, hub_ip);
 
 	spin_unlock(&adev->gmc.invalidate_lock);
 
 	if (i < adev->usec_timeout)
 		return;
 
-	DRM_ERROR("Timeout waiting for VM flush ACK!\n");
+	DRM_ERROR("Timeout waiting for VM flush hub: %d!\n", vmhub);
 }
 
 /**
@@ -320,6 +306,8 @@ static void gmc_v10_0_flush_vm_hub(struct amdgpu_device *adev, uint32_t vmid,
  *
  * @adev: amdgpu_device pointer
  * @vmid: vm instance to flush
+ * @vmhub: vmhub type
+ * @flush_type: the flush type
  *
  * Flush the TLB for the requested page table.
  */
@@ -333,10 +321,7 @@ static void gmc_v10_0_flush_gpu_tlb(struct amdgpu_device *adev, uint32_t vmid,
 	int r;
 
 	/* flush hdp cache */
-	adev->nbio.funcs->hdp_flush(adev, NULL);
-
-	if (vmhub != AMDGPU_GFXHUB_0 && adev->asic_type == CHIP_VANGOGH_LITE)
-		return;
+	adev->hdp.funcs->flush_hdp(adev, NULL);
 
 	/* For SRIOV run time, driver shouldn't access the register through MMIO
 	 * Directly use kiq to do the vm invalidation instead
@@ -386,10 +371,7 @@ static void gmc_v10_0_flush_gpu_tlb(struct amdgpu_device *adev, uint32_t vmid,
 	if (r)
 		goto error_alloc;
 
-	if (amdgpu_force_gtt)
-		job->vm_pd_addr = adev->csm_gart_paddr;
-	else
-		job->vm_pd_addr = amdgpu_gmc_pd_addr(adev->gart.bo);
+	job->vm_pd_addr = amdgpu_gmc_pd_addr(adev->gart.bo);
 	job->vm_needs_flush = true;
 	job->ibs->ptr[job->ibs->length_dw++] = ring->funcs->nop;
 	amdgpu_ring_pad_ib(ring, &job->ibs[0]);
@@ -418,6 +400,8 @@ error_alloc:
  *
  * @adev: amdgpu_device pointer
  * @pasid: pasid to be flush
+ * @flush_type: the flush type
+ * @all_hub: Used with PACKET3_INVALIDATE_TLBS_ALL_HUB()
  *
  * Flush the TLB for the requested pasid.
  */
@@ -430,6 +414,7 @@ static int gmc_v10_0_flush_gpu_tlb_pasid(struct amdgpu_device *adev,
 	uint32_t seq;
 	uint16_t queried_pasid;
 	bool ret;
+	u32 usec_timeout = amdgpu_sriov_vf(adev) ? SRIOV_USEC_TIMEOUT : adev->usec_timeout;
 	struct amdgpu_ring *ring = &adev->gfx.kiq.ring;
 	struct amdgpu_kiq *kiq = &adev->gfx.kiq;
 
@@ -448,7 +433,7 @@ static int gmc_v10_0_flush_gpu_tlb_pasid(struct amdgpu_device *adev,
 
 		amdgpu_ring_commit(ring);
 		spin_unlock(&adev->gfx.kiq.ring_lock);
-		r = amdgpu_fence_wait_polling(ring, seq, adev->usec_timeout);
+		r = amdgpu_fence_wait_polling(ring, seq, usec_timeout);
 		if (r < 1) {
 			dev_err(adev->dev, "wait for kiq fence error: %ld.\n", r);
 			return -ETIME;
@@ -457,7 +442,7 @@ static int gmc_v10_0_flush_gpu_tlb_pasid(struct amdgpu_device *adev,
 		return 0;
 	}
 
-	for (vmid = 1; vmid < 16; vmid++) {
+	for (vmid = 1; vmid < AMDGPU_NUM_VMID; vmid++) {
 
 		ret = gmc_v10_0_get_atc_vmid_pasid_mapping_info(adev, vmid,
 				&queried_pasid);
@@ -482,14 +467,9 @@ static uint64_t gmc_v10_0_emit_flush_gpu_tlb(struct amdgpu_ring *ring,
 {
 	bool use_semaphore = gmc_v10_0_use_invalidate_semaphore(ring->adev, ring->funcs->vmhub);
 	struct amdgpu_vmhub *hub = &ring->adev->vmhub[ring->funcs->vmhub];
-	uint32_t req;
+	uint32_t req = hub->vmhub_funcs->get_invalidate_req(vmid, 0);
 	unsigned eng = ring->vm_inv_eng;
 
-	if (ring->funcs->vmhub != AMDGPU_GFXHUB_0
-	    && ring->adev->asic_type == CHIP_VANGOGH_LITE)
-		return pd_addr;
-
-	req = hub->vmhub_funcs->get_invalidate_req(vmid, 0);
 	/*
 	 * It may lose gpuvm invalidate acknowldege state across power-gating
 	 * off cycle, add semaphore acquire before invalidation and semaphore
@@ -536,9 +516,6 @@ static void gmc_v10_0_emit_pasid_mapping(struct amdgpu_ring *ring, unsigned vmid
 	struct amdgpu_device *adev = ring->adev;
 	uint32_t reg;
 
-	if (adev->asic_type == CHIP_VANGOGH_LITE)
-		return;
-
 	if (ring->funcs->vmhub == AMDGPU_GFXHUB_0)
 		reg = SOC15_REG_OFFSET(OSSSYS, 0, mmIH_VMID_0_LUT) + vmid;
 	else
@@ -550,7 +527,8 @@ static void gmc_v10_0_emit_pasid_mapping(struct amdgpu_ring *ring, unsigned vmid
 /*
  * PTE format on NAVI 10:
  * 63:59 reserved
- * 58:57 reserved
+ * 58 reserved and for sienna_cichlid is used for MALL noalloc
+ * 57 reserved
  * 56 F
  * 55 L
  * 54 reserved
@@ -601,12 +579,8 @@ static void gmc_v10_0_get_vm_pde(struct amdgpu_device *adev, int level,
 				 uint64_t *addr, uint64_t *flags)
 {
 	if (!(*flags & AMDGPU_PDE_PTE) && !(*flags & AMDGPU_PTE_SYSTEM))
-		*addr = adev->vm_manager.vram_base_offset + *addr -
-			adev->gmc.vram_start;
+		*addr = amdgpu_gmc_vram_mc2pa(adev, *addr);
 	BUG_ON(*addr & 0xFFFF00000000003FULL);
-
-	if (amdgpu_force_gtt)
-		*flags |= AMDGPU_PTE_SYSTEM;
 
 	if (!adev->gmc.translate_further)
 		return;
@@ -641,9 +615,6 @@ static void gmc_v10_0_get_vm_pte(struct amdgpu_device *adev,
 		*flags |= AMDGPU_PTE_SYSTEM;
 		*flags &= ~AMDGPU_PTE_VALID;
 	}
-
-	if (amdgpu_force_gtt)
-		*flags |= AMDGPU_PTE_SYSTEM;
 }
 
 static unsigned gmc_v10_0_get_vbios_fb_size(struct amdgpu_device *adev)
@@ -668,199 +639,6 @@ static unsigned gmc_v10_0_get_vbios_fb_size(struct amdgpu_device *adev)
 	return size;
 }
 
-#if defined(CONFIG_DRM_AMDGPU_GMC_DUMP)
-static u64 gmc_v10_0_get_fault_addr(struct amdgpu_device *adev,
-				    const struct amdgpu_vmhub *hub)
-{
-	u64 addr;
-
-	addr = ((u64)(RREG32(hub->vm_l2_pro_fault_addr_hi32) &
-		GCVM_L2_PROTECTION_FAULT_ADDR_HI32__LOGICAL_PAGE_ADDR_HI4_MASK))
-		 << 32;
-	addr |= RREG32(hub->vm_l2_pro_fault_addr_lo32);
-	addr <<= PAGE_SHIFT;
-
-	return addr;
-}
-
-static size_t gmc_v10_0_get_walker_error(u32 fault_status,
-					 char *buf, size_t len)
-{
-	u32 temp32;
-
-	const char * const walker_error[] = {
-		"",
-		"Range",
-		"PDE0",
-		"PDE1",
-		"PDE2",
-		"Translate Further",
-		"NACK",
-		"Dummy Page",
-	};
-
-	temp32 = (fault_status &
-		 GCVM_L2_PROTECTION_FAULT_STATUS__WALKER_ERROR_MASK) >>
-		 GCVM_L2_PROTECTION_FAULT_STATUS__WALKER_ERROR__SHIFT;
-
-	return snprintf(buf, len, "    Walker error = %s\n",
-			walker_error[temp32]);
-}
-
-static size_t gmc_v10_0_get_permission_faults(u32 fault_status,
-					      char *buf, size_t len)
-{
-	u32 temp32, j;
-	char dump_string[64] = "";
-	const char * const permission_faults[] = {
-		"Valid",
-		"Read",
-		"Write",
-		"Execute"
-	};
-	const unsigned int num_permission_faults =
-		sizeof(permission_faults) / sizeof(const char *);
-
-	temp32 = (fault_status &
-		GCVM_L2_PROTECTION_FAULT_STATUS__PERMISSION_FAULTS_MASK) >>
-		GCVM_L2_PROTECTION_FAULT_STATUS__PERMISSION_FAULTS__SHIFT;
-	for (j = 0; j < num_permission_faults; j++) {
-		if (temp32 & (1 << j))
-			snprintf(dump_string,
-				 sizeof(dump_string), "%s %s,",
-				 dump_string,
-				 permission_faults[j]);
-	}
-
-	return snprintf(buf, len, "    Permission faults =%s\n", dump_string);
-}
-
-static size_t gmc_v10_0_get_gmc_status(struct amdgpu_device *adev,
-				       char *buf, size_t len)
-{
-	unsigned int i;
-	const struct amdgpu_vmhub *hub;
-	u32 fault_status, fault_info;
-	u64 fault_addr;
-	bool is_fault;
-	const struct amd_ip_funcs *ip_funcs;
-	bool is_gfxoff_on = false;
-	size_t size = 0;
-
-	for (i = 0; i < adev->num_ip_blocks; i++) {
-		if (adev->ip_blocks[i].version->type != AMD_IP_BLOCK_TYPE_GFX)
-			continue;
-		ip_funcs = adev->ip_blocks[i].version->funcs;
-		if (ip_funcs->is_power_on) {
-			is_gfxoff_on = ip_funcs->is_power_on((void *)adev);
-			break;
-		}
-	}
-
-	for (i = 0; i <= AMDGPU_MMHUB_0; i++) {
-		if (i == AMDGPU_GFXHUB_0 && !is_gfxoff_on) {
-			is_fault = false;
-		} else {
-			hub = &adev->vmhub[i];
-			fault_status = RREG32(hub->vm_l2_pro_fault_status);
-			fault_addr = gmc_v10_0_get_fault_addr(adev, hub);
-
-			is_fault = (fault_status || fault_addr);
-		}
-
-		if (i == AMDGPU_GFXHUB_0)
-			size += snprintf(buf + size, len - size,
-					 "VM Protection Fault (GFX HUB): %s\n",
-					 (is_fault ? "YES" : "NO"));
-		else
-			size += snprintf(buf + size, len - size,
-					 "VM Protection Fault (%s): %s\n",
-					 ((i == AMDGPU_MMHUB_0) ? "MM HUB 0" :
-					  "MM HUB 1"),
-					 (is_fault ? "YES" : "NO"));
-
-		if (is_fault) {
-			size += snprintf(buf + size, len - size,
-					 "  Protection Fault Status = 0x%08x\n",
-					 fault_status);
-			fault_info = (fault_status &
-				GCVM_L2_PROTECTION_FAULT_STATUS__VMID_MASK) >>
-				GCVM_L2_PROTECTION_FAULT_STATUS__VMID__SHIFT;
-			size += snprintf(buf + size, len - size,
-					 "    VMID = %d\n", fault_info);
-
-			size += gmc_v10_0_get_walker_error(fault_status,
-							   buf + size,
-							   len - size);
-			size += gmc_v10_0_get_permission_faults(fault_status,
-								buf + size,
-								len - size);
-
-			fault_info = (fault_status &
-				GCVM_L2_PROTECTION_FAULT_STATUS__CID_MASK) >>
-				GCVM_L2_PROTECTION_FAULT_STATUS__CID__SHIFT;
-			size += snprintf(buf + size, len - size,
-					 "    Memory client id = %d\n",
-					 fault_info);
-
-			fault_info = (fault_status &
-				GCVM_L2_PROTECTION_FAULT_STATUS__RW_MASK) >>
-				GCVM_L2_PROTECTION_FAULT_STATUS__RW__SHIFT;
-			size += snprintf(buf + size, len - size,
-					 "    Memory client R/W = %s\n",
-					 (fault_info ? "WRITE" : "READ"));
-
-			size += snprintf(buf + size, len - size,
-					 "  Protection Fault GPU Address = 0x%016llx\n",
-					 fault_addr);
-			size += snprintf(buf + size, len - size,
-					 "TODO: Dump VMPT entries of fault address\n");
-		}
-	}
-
-	return size;
-}
-#endif /* CONFIG_DRM_AMDGPU_GMC_DuMP */
-
-void gmc_v10_0_sws_flush_gpu_tlb(u32 vmid, struct amdgpu_bo *root_bo,
-				  struct amdgpu_ring *ring)
-{
-	int i;
-	u32 tmp;
-	u64 vm_pd_addr;
-
-	struct amdgpu_device *adev = ring->adev;
-	struct amdgpu_vmhub *hub = &adev->vmhub[ring->funcs->vmhub];
-	u32 req = hub->vmhub_funcs->get_invalidate_req(vmid, 0);
-	u32 eng = ring->vm_inv_eng;
-
-	vm_pd_addr = amdgpu_gmc_pd_addr(root_bo);
-	WREG32(hub->ctx0_ptb_addr_lo32 + (hub->ctx_addr_distance * vmid),
-	       lower_32_bits(vm_pd_addr));
-
-	WREG32(hub->ctx0_ptb_addr_hi32 + (hub->ctx_addr_distance * vmid),
-	       upper_32_bits(vm_pd_addr));
-
-	WREG32(hub->vm_inv_eng0_req + hub->eng_distance * eng, req);
-	RREG32(hub->vm_inv_eng0_req + hub->eng_distance * eng);
-
-	/* Wait for ACK with a delay.*/
-	for (i = 0; i < adev->usec_timeout; i++) {
-		tmp = RREG32(hub->vm_inv_eng0_ack + hub->eng_distance * eng);
-		tmp &= 1 << vmid;
-		if (tmp)
-			break;
-
-		if (!amdgpu_emu_mode)
-			udelay(1);
-		else
-			mdelay(1);
-	}
-
-	if (i == adev->usec_timeout)
-		DRM_WARN("Timeout to flush(0x%x) sws VM(%d)\n", tmp, vmid);
-}
-
 static const struct amdgpu_gmc_funcs gmc_v10_0_gmc_funcs = {
 	.flush_gpu_tlb = gmc_v10_0_flush_gpu_tlb,
 	.flush_gpu_tlb_pasid = gmc_v10_0_flush_gpu_tlb_pasid,
@@ -870,10 +648,6 @@ static const struct amdgpu_gmc_funcs gmc_v10_0_gmc_funcs = {
 	.get_vm_pde = gmc_v10_0_get_vm_pde,
 	.get_vm_pte = gmc_v10_0_get_vm_pte,
 	.get_vbios_fb_size = gmc_v10_0_get_vbios_fb_size,
-#if defined(CONFIG_DRM_AMDGPU_GMC_DUMP)
-	.get_gmc_status = gmc_v10_0_get_gmc_status,
-#endif
-	.sws_flush_gpu_tlb = gmc_v10_0_sws_flush_gpu_tlb,
 };
 
 static void gmc_v10_0_set_gmc_funcs(struct amdgpu_device *adev)
@@ -891,7 +665,7 @@ static void gmc_v10_0_set_umc_funcs(struct amdgpu_device *adev)
 		adev->umc.umc_inst_num = UMC_V8_7_UMC_INSTANCE_NUM;
 		adev->umc.channel_offs = UMC_V8_7_PER_CHANNEL_OFFSET_SIENNA;
 		adev->umc.channel_idx_tbl = &umc_v8_7_channel_idx_tbl[0][0];
-		adev->umc.funcs = &umc_v8_7_funcs;
+		adev->umc.ras_funcs = &umc_v8_7_ras_funcs;
 		break;
 	default:
 		break;
@@ -901,7 +675,15 @@ static void gmc_v10_0_set_umc_funcs(struct amdgpu_device *adev)
 
 static void gmc_v10_0_set_mmhub_funcs(struct amdgpu_device *adev)
 {
-	adev->mmhub.funcs = &mmhub_v2_0_funcs;
+	switch (adev->asic_type) {
+	case CHIP_VANGOGH:
+	case CHIP_YELLOW_CARP:
+		adev->mmhub.funcs = &mmhub_v2_3_funcs;
+		break;
+	default:
+		adev->mmhub.funcs = &mmhub_v2_0_funcs;
+		break;
+	}
 }
 
 static void gmc_v10_0_set_gfxhub_funcs(struct amdgpu_device *adev)
@@ -909,7 +691,10 @@ static void gmc_v10_0_set_gfxhub_funcs(struct amdgpu_device *adev)
 	switch (adev->asic_type) {
 	case CHIP_SIENNA_CICHLID:
 	case CHIP_NAVY_FLOUNDER:
-	case CHIP_VANGOGH_LITE:
+	case CHIP_VANGOGH:
+	case CHIP_DIMGREY_CAVEFISH:
+	case CHIP_BEIGE_GOBY:
+	case CHIP_YELLOW_CARP:
 		adev->gfxhub.funcs = &gfxhub_v2_1_funcs;
 		break;
 	default:
@@ -944,8 +729,6 @@ static int gmc_v10_0_late_init(void *handle)
 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
 	int r;
 
-	amdgpu_bo_late_init(adev);
-
 	r = amdgpu_gmc_allocate_vm_inv_eng(adev);
 	if (r)
 		return r;
@@ -954,10 +737,7 @@ static int gmc_v10_0_late_init(void *handle)
 	if (r)
 		return r;
 
-	if (adev->ddev.irq_enabled)
-		r = amdgpu_irq_get(adev, &adev->gmc.vm_fault, 0);
-
-	return r;
+	return amdgpu_irq_get(adev, &adev->gmc.vm_fault, 0);
 }
 
 static void gmc_v10_0_vram_gtt_location(struct amdgpu_device *adev,
@@ -972,6 +752,7 @@ static void gmc_v10_0_vram_gtt_location(struct amdgpu_device *adev,
 
 	amdgpu_gmc_vram_location(adev, &adev->gmc, base);
 	amdgpu_gmc_gart_location(adev, mc);
+	amdgpu_gmc_agp_location(adev, mc);
 
 	/* base offset of vram pages */
 	adev->vm_manager.vram_base_offset = adev->gfxhub.funcs->get_mc_fb_offset(adev);
@@ -999,20 +780,20 @@ static int gmc_v10_0_mc_init(struct amdgpu_device *adev)
 		adev->nbio.funcs->get_memsize(adev) * 1024ULL * 1024ULL;
 	adev->gmc.real_vram_size = adev->gmc.mc_vram_size;
 
-	if (!(adev->flags & AMD_IS_APU)
-	    && (adev->asic_type != CHIP_VANGOGH_LITE)) {
+	if (!(adev->flags & AMD_IS_APU)) {
 		r = amdgpu_device_resize_fb_bar(adev);
 		if (r)
 			return r;
 	}
-	if (adev->pdev) {
-		adev->gmc.aper_base = pci_resource_start(adev->pdev, 0);
-		adev->gmc.aper_size = pci_resource_len(adev->pdev, 0);
-	} else {
-		adev->gmc.aper_base = 0;
-		adev->gmc.aper_size = 0;
+	adev->gmc.aper_base = pci_resource_start(adev->pdev, 0);
+	adev->gmc.aper_size = pci_resource_len(adev->pdev, 0);
 
+#ifdef CONFIG_X86_64
+	if ((adev->flags & AMD_IS_APU) && !amdgpu_passthrough(adev)) {
+		adev->gmc.aper_base = adev->gfxhub.funcs->get_mc_fb_offset(adev);
+		adev->gmc.aper_size = adev->gmc.real_vram_size;
 	}
+#endif
 
 	/* In case the PCI BAR is larger than the actual amount of vram */
 	adev->gmc.visible_vram_size = adev->gmc.aper_size;
@@ -1027,7 +808,11 @@ static int gmc_v10_0_mc_init(struct amdgpu_device *adev)
 		case CHIP_NAVI12:
 		case CHIP_SIENNA_CICHLID:
 		case CHIP_NAVY_FLOUNDER:
-		case CHIP_VANGOGH_LITE:
+		case CHIP_VANGOGH:
+		case CHIP_DIMGREY_CAVEFISH:
+		case CHIP_BEIGE_GOBY:
+		case CHIP_YELLOW_CARP:
+		case CHIP_CYAN_SKILLFISH:
 		default:
 			adev->gmc.gart_size = 512ULL << 20;
 			break;
@@ -1044,8 +829,8 @@ static int gmc_v10_0_gart_init(struct amdgpu_device *adev)
 {
 	int r;
 
-	if (adev->gart.bo||adev->csm_gart_vaddr) {
-		WARN(1, "GART already initialized\n");
+	if (adev->gart.bo) {
+		WARN(1, "NAVI10 PCIE GART already initialized\n");
 		return 0;
 	}
 
@@ -1058,10 +843,7 @@ static int gmc_v10_0_gart_init(struct amdgpu_device *adev)
 	adev->gart.gart_pte_flags = AMDGPU_PTE_MTYPE_NV10(MTYPE_UC) |
 				 AMDGPU_PTE_EXECUTABLE;
 
-	if (amdgpu_force_gtt)
-		return amdgpu_gart_table_sysram_alloc(adev);
-	else
-		return amdgpu_gart_table_vram_alloc(adev);
+	return amdgpu_gart_table_vram_alloc(adev);
 }
 
 static int gmc_v10_0_sw_init(void *handle)
@@ -1075,12 +857,14 @@ static int gmc_v10_0_sw_init(void *handle)
 
 	spin_lock_init(&adev->gmc.invalidate_lock);
 
-	if (adev->asic_type == CHIP_VANGOGH_LITE && amdgpu_emu_mode == 1) {
+	if ((adev->flags & AMD_IS_APU) && amdgpu_emu_mode == 1) {
+		adev->gmc.vram_type = AMDGPU_VRAM_TYPE_DDR4;
+		adev->gmc.vram_width = 64;
+	} else if (amdgpu_emu_mode == 1) {
 		adev->gmc.vram_type = AMDGPU_VRAM_TYPE_GDDR6;
 		adev->gmc.vram_width = 1 * 128; /* numchan * chansize */
 	} else {
-		if (adev->asic_type != CHIP_VANGOGH_LITE)
-			r = amdgpu_atomfirmware_get_vram_info(adev,
+		r = amdgpu_atomfirmware_get_vram_info(adev,
 				&vram_width, &vram_type, &vram_vendor);
 		adev->gmc.vram_width = vram_width;
 
@@ -1094,6 +878,11 @@ static int gmc_v10_0_sw_init(void *handle)
 	case CHIP_NAVI12:
 	case CHIP_SIENNA_CICHLID:
 	case CHIP_NAVY_FLOUNDER:
+	case CHIP_VANGOGH:
+	case CHIP_DIMGREY_CAVEFISH:
+	case CHIP_BEIGE_GOBY:
+	case CHIP_YELLOW_CARP:
+	case CHIP_CYAN_SKILLFISH:
 		adev->num_vmhubs = 2;
 		/*
 		 * To fulfill 4-level page support,
@@ -1102,30 +891,17 @@ static int gmc_v10_0_sw_init(void *handle)
 		 */
 		amdgpu_vm_adjust_size(adev, 256 * 1024, 9, 3, 48);
 		break;
-
-	case CHIP_VANGOGH_LITE:
-		adev->num_vmhubs = 1;
-		/*
-		 * To fulfill 4-level page support,
-		 * vm size is 256TB (48bit), maximum size of Navi10/Navi14/Navi12,
-		 * block size 512 (9bit)
-		 */
-		amdgpu_vm_adjust_size(adev, 256 * 1024, 9, 3, 48);
-		break;
-
 	default:
 		break;
 	}
 
 	/* This interrupt is VMC page fault.*/
-	if (adev->asic_type != CHIP_VANGOGH_LITE) {
-		r = amdgpu_irq_add_id(adev, SOC15_IH_CLIENTID_VMC,
-				      VMC_1_0__SRCID__VM_FAULT,
-				      &adev->gmc.vm_fault);
+	r = amdgpu_irq_add_id(adev, SOC15_IH_CLIENTID_VMC,
+			      VMC_1_0__SRCID__VM_FAULT,
+			      &adev->gmc.vm_fault);
 
-		if (r)
-			return r;
-	}
+	if (r)
+		return r;
 
 	r = amdgpu_irq_add_id(adev, SOC15_IH_CLIENTID_UTCL2,
 			      UTCL2_1_0__SRCID__FAULT,
@@ -1163,8 +939,8 @@ static int gmc_v10_0_sw_init(void *handle)
 	if (r)
 		return r;
 
-	if (adev->asic_type != CHIP_VANGOGH_LITE)
-		amdgpu_gmc_get_vbios_allocations(adev);
+	amdgpu_gmc_get_vbios_allocations(adev);
+	amdgpu_gmc_get_reserved_allocation(adev);
 
 	/* Memory manager */
 	r = amdgpu_bo_init(adev);
@@ -1189,7 +965,7 @@ static int gmc_v10_0_sw_init(void *handle)
 }
 
 /**
- * gmc_v8_0_gart_fini - vm fini callback
+ * gmc_v10_0_gart_fini - vm fini callback
  *
  * @adev: amdgpu_device pointer
  *
@@ -1197,12 +973,7 @@ static int gmc_v10_0_sw_init(void *handle)
  */
 static void gmc_v10_0_gart_fini(struct amdgpu_device *adev)
 {
-	if (amdgpu_force_gtt)
-		amdgpu_gart_table_sysram_free(adev);
-	else
-		amdgpu_gart_table_vram_free(adev);
-
-	amdgpu_gart_fini(adev);
+	amdgpu_gart_table_vram_free(adev);
 }
 
 static int gmc_v10_0_sw_fini(void *handle)
@@ -1225,7 +996,11 @@ static void gmc_v10_0_init_golden_registers(struct amdgpu_device *adev)
 	case CHIP_NAVI12:
 	case CHIP_SIENNA_CICHLID:
 	case CHIP_NAVY_FLOUNDER:
-	case CHIP_VANGOGH_LITE:
+	case CHIP_VANGOGH:
+	case CHIP_DIMGREY_CAVEFISH:
+	case CHIP_BEIGE_GOBY:
+	case CHIP_YELLOW_CARP:
+	case CHIP_CYAN_SKILLFISH:
 		break;
 	default:
 		break;
@@ -1241,20 +1016,20 @@ static int gmc_v10_0_gart_enable(struct amdgpu_device *adev)
 {
 	int r;
 	bool value;
-	u32 tmp;
 
-	if (!adev->gart.bo &&
-	    amdgpu_force_gtt == 0) {
+	if (adev->gart.bo == NULL) {
 		dev_err(adev->dev, "No VRAM object for PCIE GART.\n");
 		return -EINVAL;
 	}
 
-	if (amdgpu_force_gtt == 0) {
-		r = amdgpu_gart_table_vram_pin(adev);
-		if (r)
-			return r;
-	}
+	if (amdgpu_sriov_vf(adev) && amdgpu_in_reset(adev))
+		goto skip_pin_bo;
 
+	r = amdgpu_gart_table_vram_pin(adev);
+	if (r)
+		return r;
+
+skip_pin_bo:
 	r = adev->gfxhub.funcs->gart_enable(adev);
 	if (r)
 		return r;
@@ -1263,17 +1038,10 @@ static int gmc_v10_0_gart_enable(struct amdgpu_device *adev)
 	if (r)
 		return r;
 
-	if (adev->asic_type != CHIP_VANGOGH_LITE) {
-		tmp = RREG32_SOC15(HDP, 0, mmHDP_MISC_CNTL);
-		tmp |= HDP_MISC_CNTL__FLUSH_INVALIDATE_CACHE_MASK;
-		WREG32_SOC15(HDP, 0, mmHDP_MISC_CNTL, tmp);
+	adev->hdp.funcs->init_registers(adev);
 
-		tmp = RREG32_SOC15(HDP, 0, mmHDP_HOST_PATH_CNTL);
-		WREG32_SOC15(HDP, 0, mmHDP_HOST_PATH_CNTL, tmp);
-
-		/* Flush HDP after it is initialized */
-		adev->nbio.funcs->hdp_flush(adev, NULL);
-	}
+	/* Flush HDP after it is initialized */
+	adev->hdp.funcs->flush_hdp(adev, NULL);
 
 	value = (amdgpu_vm_fault_stop == AMDGPU_VM_FAULT_STOP_ALWAYS) ?
 		false : true;
@@ -1284,13 +1052,13 @@ static int gmc_v10_0_gart_enable(struct amdgpu_device *adev)
 	gmc_v10_0_flush_gpu_tlb(adev, 0, AMDGPU_GFXHUB_0, 0);
 
 	if (amdgpu_force_gtt)
-		DRM_DEBUG("PCIE GART of %uM enabled (table at 0x%016llX).\n",
-			 (u32)(adev->gmc.gart_size >> 20),
-			 adev->csm_gart_paddr);
+		DRM_INFO("SGPU GART of %uM enabled (table at 0x%016llX).\n",
+		 (unsigned)(adev->gart.table_size),
+		 (unsigned long long)adev->csm_gart_paddr);
 	else
-		DRM_DEBUG("PCIE GART of %uM enabled (table at 0x%016llX).\n",
-			 (u32)(adev->gmc.gart_size >> 20),
-			 (u64)amdgpu_bo_gpu_offset(adev->gart.bo));
+		DRM_INFO("PCIE GART of %uM enabled (table at 0x%016llX).\n",
+		 (unsigned)(adev->gmc.gart_size >> 20),
+		 (unsigned long long)amdgpu_bo_gpu_offset(adev->gart.bo));
 
 	adev->gart.ready = true;
 
@@ -1304,6 +1072,13 @@ static int gmc_v10_0_hw_init(void *handle)
 
 	/* The sequence of these two function calls matters.*/
 	gmc_v10_0_init_golden_registers(adev);
+
+	/*
+	 * harvestable groups in gc_utcl2 need to be programmed before any GFX block
+	 * register setup within GMC, or else system hang when harvesting SA.
+	 */
+	if (adev->gfxhub.funcs && adev->gfxhub.funcs->utcl2_harvest)
+		adev->gfxhub.funcs->utcl2_harvest(adev);
 
 	r = gmc_v10_0_gart_enable(adev);
 	if (r)
@@ -1326,13 +1101,14 @@ static void gmc_v10_0_gart_disable(struct amdgpu_device *adev)
 {
 	adev->gfxhub.funcs->gart_disable(adev);
 	adev->mmhub.funcs->gart_disable(adev);
-	if (amdgpu_force_gtt == 0)
-		amdgpu_gart_table_vram_unpin(adev);
+	amdgpu_gart_table_vram_unpin(adev);
 }
 
 static int gmc_v10_0_hw_fini(void *handle)
 {
 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+
+	gmc_v10_0_gart_disable(adev);
 
 	if (amdgpu_sriov_vf(adev)) {
 		/* full access mode, so don't touch any GMC register */
@@ -1342,7 +1118,6 @@ static int gmc_v10_0_hw_fini(void *handle)
 
 	amdgpu_irq_put(adev, &adev->gmc.ecc_irq, 0);
 	amdgpu_irq_put(adev, &adev->gmc.vm_fault, 0);
-	gmc_v10_0_gart_disable(adev);
 
 	return 0;
 }
@@ -1397,8 +1172,8 @@ static int gmc_v10_0_set_clockgating_state(void *handle,
 	if (r)
 		return r;
 
-	if (adev->asic_type == CHIP_SIENNA_CICHLID ||
-	    adev->asic_type == CHIP_NAVY_FLOUNDER)
+	if (adev->asic_type >= CHIP_SIENNA_CICHLID &&
+	    adev->asic_type <= CHIP_YELLOW_CARP)
 		return athub_v2_1_set_clockgating(adev, state);
 	else
 		return athub_v2_0_set_clockgating(adev, state);
@@ -1410,8 +1185,8 @@ static void gmc_v10_0_get_clockgating_state(void *handle, u32 *flags)
 
 	adev->mmhub.funcs->get_clockgating(adev, flags);
 
-	if (adev->asic_type == CHIP_SIENNA_CICHLID ||
-	    adev->asic_type == CHIP_NAVY_FLOUNDER)
+	if (adev->asic_type >= CHIP_SIENNA_CICHLID &&
+	    adev->asic_type <= CHIP_YELLOW_CARP)
 		athub_v2_1_get_clockgating(adev, flags);
 	else
 		athub_v2_0_get_clockgating(adev, flags);

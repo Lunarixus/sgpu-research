@@ -1,5 +1,5 @@
 /*
- * Copyright 2016-2021 Advanced Micro Devices, Inc.
+ * Copyright 2016 Advanced Micro Devices, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -31,23 +31,15 @@ uint64_t amdgpu_csa_vaddr(struct amdgpu_device *adev)
 	addr -= AMDGPU_VA_RESERVED_SIZE;
 	addr = amdgpu_gmc_sign_extend(addr);
 
-	/*
-	 * On Navi14 mapping CSA to higher 48bit address causing GPU hang
-	 * Currently mapping CSA/metadata to lower 48bit address as workaround
-	 */
-	if (adev->asic_type == CHIP_NAVI14)
-		return 0x1000000;
-	else
-		return addr;
+	return addr;
 }
 
 int amdgpu_allocate_static_csa(struct amdgpu_device *adev, struct amdgpu_bo **bo,
 				u32 domain, uint32_t size)
 {
-	int r;
 	void *ptr;
 
-	r = amdgpu_bo_create_kernel(adev, size, PAGE_SIZE,
+	amdgpu_bo_create_kernel(adev, size, PAGE_SIZE,
 				domain, bo,
 				NULL, &ptr);
 	if (!*bo)

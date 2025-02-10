@@ -21,11 +21,6 @@
  *
  */
 
-/*
-* @file nvd.h
-* @copyright 2020 Samsung Electronics
-*/
-
 #ifndef NVD_H
 #define NVD_H
 
@@ -149,10 +144,6 @@
 		 */
 #define		INDIRECT_BUFFER_PRE_ENB(x)		((x) << 21)
 #define		INDIRECT_BUFFER_PRE_RESUME(x)           ((x) << 30)
-#define         INDIRECT_BUFFER_GET_GPU_ADDR_LO(x)	((uint64_t)(x))
-#define         INDIRECT_BUFFER_GET_GPU_ADDR_HI(x)	((uint64_t)(x) << 32)
-#define         INDIRECT_BUFFER_GET_SIZE(x)		((x) & GENMASK(19, 0))
-#define         INDIRECT_BUFFER_GET_VMID(x)	(((x) & GENMASK(27, 24)) >> 24)
 #define	PACKET3_COND_INDIRECT_BUFFER			0x3F
 #define	PACKET3_COPY_DATA				0x40
 #define	PACKET3_CP_DMA					0x41

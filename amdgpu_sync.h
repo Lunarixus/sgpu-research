@@ -30,7 +30,6 @@ struct dma_fence;
 struct dma_resv;
 struct amdgpu_device;
 struct amdgpu_ring;
-struct amdgpu_job;
 
 enum amdgpu_sync_mode {
 	AMDGPU_SYNC_ALWAYS,
@@ -61,8 +60,5 @@ int amdgpu_sync_wait(struct amdgpu_sync *sync, bool intr);
 void amdgpu_sync_free(struct amdgpu_sync *sync);
 int amdgpu_sync_init(void);
 void amdgpu_sync_fini(void);
-
-void sgpu_sync_trace_fence(struct amdgpu_sync *sync);
-int sgpu_sync_external_fence_tracker(struct amdgpu_job *job);
 
 #endif
