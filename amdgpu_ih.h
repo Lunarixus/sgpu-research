@@ -51,6 +51,7 @@ struct amdgpu_ih_ring {
 	u32			doorbell_index;
 	bool			use_doorbell;
 	bool			use_bus_addr;
+	bool			use_write_back;
 
 	struct amdgpu_bo	*ring_obj;
 	volatile uint32_t	*ring;
@@ -68,6 +69,7 @@ struct amdgpu_ih_ring {
 
 	/* For waiting on IH processing at checkpoint. */
 	wait_queue_head_t wait_process;
+	atomic_t		last_rptr;
 };
 
 /* provided by the ih block */

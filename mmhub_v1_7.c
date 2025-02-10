@@ -165,6 +165,7 @@ static void mmhub_v1_7_init_tlb_regs(struct amdgpu_device *adev)
 			    ENABLE_ADVANCED_DRIVER_MODEL, 1);
 	tmp = REG_SET_FIELD(tmp, MC_VM_MX_L1_TLB_CNTL,
 			    SYSTEM_APERTURE_UNMAPPED_ACCESS, 0);
+	tmp = REG_SET_FIELD(tmp, MC_VM_MX_L1_TLB_CNTL, ECO_BITS, 0);
 	tmp = REG_SET_FIELD(tmp, MC_VM_MX_L1_TLB_CNTL,
 			    MTYPE, MTYPE_UC);/* XXX for emulation. */
 	tmp = REG_SET_FIELD(tmp, MC_VM_MX_L1_TLB_CNTL, ATC_EN, 1);
@@ -453,92 +454,12 @@ static void mmhub_v1_7_init(struct amdgpu_device *adev)
 
 }
 
-static void mmhub_v1_7_update_medium_grain_clock_gating(struct amdgpu_device *adev,
-							bool enable)
-{
-	uint32_t def, data, def1, data1, def2 = 0, data2 = 0;
-
-	def  = data  = RREG32_SOC15(MMHUB, 0, regATC_L2_MISC_CG);
-
-	def1 = data1 = RREG32_SOC15(MMHUB, 0, regDAGB0_CNTL_MISC2);
-	def2 = data2 = RREG32_SOC15(MMHUB, 0, regDAGB1_CNTL_MISC2);
-
-	if (enable) {
-		data |= ATC_L2_MISC_CG__ENABLE_MASK;
-
-		data1 &= ~(DAGB0_CNTL_MISC2__DISABLE_WRREQ_CG_MASK |
-		           DAGB0_CNTL_MISC2__DISABLE_WRRET_CG_MASK |
-		           DAGB0_CNTL_MISC2__DISABLE_RDREQ_CG_MASK |
-		           DAGB0_CNTL_MISC2__DISABLE_RDRET_CG_MASK |
-		           DAGB0_CNTL_MISC2__DISABLE_TLBWR_CG_MASK |
-		           DAGB0_CNTL_MISC2__DISABLE_TLBRD_CG_MASK);
-
-		data2 &= ~(DAGB1_CNTL_MISC2__DISABLE_WRREQ_CG_MASK |
-		           DAGB1_CNTL_MISC2__DISABLE_WRRET_CG_MASK |
-		           DAGB1_CNTL_MISC2__DISABLE_RDREQ_CG_MASK |
-		           DAGB1_CNTL_MISC2__DISABLE_RDRET_CG_MASK |
-		           DAGB1_CNTL_MISC2__DISABLE_TLBWR_CG_MASK |
-		           DAGB1_CNTL_MISC2__DISABLE_TLBRD_CG_MASK);
-	} else {
-		data &= ~ATC_L2_MISC_CG__ENABLE_MASK;
-
-		data1 |= (DAGB0_CNTL_MISC2__DISABLE_WRREQ_CG_MASK |
-			  DAGB0_CNTL_MISC2__DISABLE_WRRET_CG_MASK |
-			  DAGB0_CNTL_MISC2__DISABLE_RDREQ_CG_MASK |
-			  DAGB0_CNTL_MISC2__DISABLE_RDRET_CG_MASK |
-			  DAGB0_CNTL_MISC2__DISABLE_TLBWR_CG_MASK |
-			  DAGB0_CNTL_MISC2__DISABLE_TLBRD_CG_MASK);
-
-		data2 |= (DAGB1_CNTL_MISC2__DISABLE_WRREQ_CG_MASK |
-		          DAGB1_CNTL_MISC2__DISABLE_WRRET_CG_MASK |
-		          DAGB1_CNTL_MISC2__DISABLE_RDREQ_CG_MASK |
-		          DAGB1_CNTL_MISC2__DISABLE_RDRET_CG_MASK |
-		          DAGB1_CNTL_MISC2__DISABLE_TLBWR_CG_MASK |
-		          DAGB1_CNTL_MISC2__DISABLE_TLBRD_CG_MASK);
-	}
-
-	if (def != data)
-		WREG32_SOC15(MMHUB, 0, regATC_L2_MISC_CG, data);
-
-	if (def1 != data1)
-		WREG32_SOC15(MMHUB, 0, regDAGB0_CNTL_MISC2, data1);
-
-	if (def2 != data2)
-		WREG32_SOC15(MMHUB, 0, regDAGB1_CNTL_MISC2, data2);
-}
-
-static void mmhub_v1_7_update_medium_grain_light_sleep(struct amdgpu_device *adev,
-						       bool enable)
-{
-	uint32_t def, data;
-
-	def = data = RREG32_SOC15(MMHUB, 0, regATC_L2_MISC_CG);
-
-	if (enable)
-		data |= ATC_L2_MISC_CG__MEM_LS_ENABLE_MASK;
-	else
-		data &= ~ATC_L2_MISC_CG__MEM_LS_ENABLE_MASK;
-
-	if (def != data)
-		WREG32_SOC15(MMHUB, 0, regATC_L2_MISC_CG, data);
-}
-
 static int mmhub_v1_7_set_clockgating(struct amdgpu_device *adev,
 			       enum amd_clockgating_state state)
 {
 	if (amdgpu_sriov_vf(adev))
 		return 0;
-
-	/* Change state only if MCCG support is enabled through driver */
-	if (adev->cg_flags & AMD_CG_SUPPORT_MC_MGCG)
-		mmhub_v1_7_update_medium_grain_clock_gating(adev,
-				state == AMD_CG_STATE_GATE);
-
-	/* Change state only if LS support is enabled through driver */
-	if (adev->cg_flags & AMD_CG_SUPPORT_MC_LS)
-		mmhub_v1_7_update_medium_grain_light_sleep(adev,
-				state == AMD_CG_STATE_GATE);
-
+	
 	return 0;
 }
 

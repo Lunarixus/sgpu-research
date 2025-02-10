@@ -27,6 +27,10 @@
 #include "nbio/nbio_2_3_default.h"
 #include "nbio/nbio_2_3_offset.h"
 #include "nbio/nbio_2_3_sh_mask.h"
+#include "gc/gc_10_4_0_default.h"
+#include "gc/gc_10_4_0_offset.h"
+#include "gc/gc_10_4_0_sh_mask.h"
+
 #include <uapi/linux/kfd_ioctl.h>
 #include <linux/pci.h>
 
@@ -78,6 +82,11 @@ static u32 nbio_v2_3_get_rev_id(struct amdgpu_device *adev)
 	tmp >>= RCC_DEV0_EPF0_STRAP0__STRAP_ATI_REV_ID_DEV0_F0__SHIFT;
 
 	return tmp;
+}
+
+static u32 nbio_v2_3_get_chip_revision(struct amdgpu_device *adev)
+{
+	return RREG32_SOC15(GC, 0, mmGRBM_CHIP_REVISION);
 }
 
 static void nbio_v2_3_mc_access_enable(struct amdgpu_device *adev, bool enable)
@@ -220,9 +229,6 @@ static void nbio_v2_3_update_medium_grain_clock_gating(struct amdgpu_device *ade
 {
 	uint32_t def, data;
 
-	if (!(adev->cg_flags & AMD_CG_SUPPORT_BIF_MGCG))
-		return;
-
 	def = data = RREG32_PCIE(smnCPM_CONTROL);
 	if (enable) {
 		data |= (CPM_CONTROL__LCLK_DYN_GATE_ENABLE_MASK |
@@ -248,9 +254,6 @@ static void nbio_v2_3_update_medium_grain_light_sleep(struct amdgpu_device *adev
 						      bool enable)
 {
 	uint32_t def, data;
-
-	if (!(adev->cg_flags & AMD_CG_SUPPORT_BIF_LS))
-		return;
 
 	def = data = RREG32_PCIE(smnPCIE_CNTL2);
 	if (enable) {
@@ -322,6 +325,9 @@ static void nbio_v2_3_init_registers(struct amdgpu_device *adev)
 {
 	uint32_t def, data;
 
+	if (!adev->pdev)
+		return;
+
 	def = data = RREG32_PCIE(smnPCIE_CONFIG_CNTL);
 	data = REG_SET_FIELD(data, PCIE_CONFIG_CNTL, CI_SWUS_MAX_READ_REQUEST_SIZE_MODE, 1);
 	data = REG_SET_FIELD(data, PCIE_CONFIG_CNTL, CI_SWUS_MAX_READ_REQUEST_SIZE_PRIV, 1);
@@ -366,7 +372,6 @@ static void nbio_v2_3_enable_aspm(struct amdgpu_device *adev,
 		WREG32_PCIE(smnPCIE_LC_CNTL, data);
 }
 
-#ifdef CONFIG_PCIEASPM
 static void nbio_v2_3_program_ltr(struct amdgpu_device *adev)
 {
 	uint32_t def, data;
@@ -388,11 +393,9 @@ static void nbio_v2_3_program_ltr(struct amdgpu_device *adev)
 	if (def != data)
 		WREG32_PCIE(smnBIF_CFG_DEV0_EPF0_DEVICE_CNTL2, data);
 }
-#endif
 
 static void nbio_v2_3_program_aspm(struct amdgpu_device *adev)
 {
-#ifdef CONFIG_PCIEASPM
 	uint32_t def, data;
 
 	def = data = RREG32_PCIE(smnPCIE_LC_CNTL);
@@ -448,10 +451,7 @@ static void nbio_v2_3_program_aspm(struct amdgpu_device *adev)
 	if (def != data)
 		WREG32_PCIE(smnPCIE_LC_CNTL6, data);
 
-	/* Don't bother about LTR if LTR is not enabled
-	 * in the path */
-	if (adev->pdev->ltr_path)
-		nbio_v2_3_program_ltr(adev);
+	nbio_v2_3_program_ltr(adev);
 
 	def = data = RREG32_SOC15(NBIO, 0, mmRCC_BIF_STRAP3);
 	data |= 0x5DE0 << RCC_BIF_STRAP3__STRAP_VLINK_ASPM_IDLE_TIMER__SHIFT;
@@ -475,7 +475,6 @@ static void nbio_v2_3_program_aspm(struct amdgpu_device *adev)
 	data &= ~PCIE_LC_CNTL3__LC_DSC_DONT_ENTER_L23_AFTER_PME_ACK_MASK;
 	if (def != data)
 		WREG32_PCIE(smnPCIE_LC_CNTL3, data);
-#endif
 }
 
 static void nbio_v2_3_apply_lc_spc_mode_wa(struct amdgpu_device *adev)
@@ -541,6 +540,7 @@ const struct amdgpu_nbio_funcs nbio_v2_3_funcs = {
 	.get_pcie_index_offset = nbio_v2_3_get_pcie_index_offset,
 	.get_pcie_data_offset = nbio_v2_3_get_pcie_data_offset,
 	.get_rev_id = nbio_v2_3_get_rev_id,
+	.get_chip_revision = nbio_v2_3_get_chip_revision,
 	.mc_access_enable = nbio_v2_3_mc_access_enable,
 	.get_memsize = nbio_v2_3_get_memsize,
 	.sdma_doorbell_range = nbio_v2_3_sdma_doorbell_range,

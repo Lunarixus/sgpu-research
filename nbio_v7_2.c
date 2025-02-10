@@ -225,21 +225,6 @@ static void nbio_v7_2_update_medium_grain_clock_gating(struct amdgpu_device *ade
 	uint32_t def, data;
 
 	def = data = RREG32_PCIE_PORT(SOC15_REG_OFFSET(NBIO, 0, regCPM_CONTROL));
-	if (enable && (adev->cg_flags & AMD_CG_SUPPORT_BIF_MGCG)) {
-		data |= (CPM_CONTROL__LCLK_DYN_GATE_ENABLE_MASK |
-			 CPM_CONTROL__TXCLK_DYN_GATE_ENABLE_MASK |
-			 CPM_CONTROL__TXCLK_LCNT_GATE_ENABLE_MASK |
-			 CPM_CONTROL__TXCLK_REGS_GATE_ENABLE_MASK |
-			 CPM_CONTROL__TXCLK_PRBS_GATE_ENABLE_MASK |
-			 CPM_CONTROL__REFCLK_REGS_GATE_ENABLE_MASK);
-	} else {
-		data &= ~(CPM_CONTROL__LCLK_DYN_GATE_ENABLE_MASK |
-			  CPM_CONTROL__TXCLK_DYN_GATE_ENABLE_MASK |
-			  CPM_CONTROL__TXCLK_LCNT_GATE_ENABLE_MASK |
-			  CPM_CONTROL__TXCLK_REGS_GATE_ENABLE_MASK |
-			  CPM_CONTROL__TXCLK_PRBS_GATE_ENABLE_MASK |
-			  CPM_CONTROL__REFCLK_REGS_GATE_ENABLE_MASK);
-	}
 
 	if (def != data)
 		WREG32_PCIE_PORT(SOC15_REG_OFFSET(NBIO, 0, regCPM_CONTROL), data);
@@ -252,36 +237,18 @@ static void nbio_v7_2_update_medium_grain_light_sleep(struct amdgpu_device *adev
 
 	if (adev->asic_type == CHIP_YELLOW_CARP) {
 		def = data = RREG32_PCIE_PORT(SOC15_REG_OFFSET(NBIO, 0, regPCIE_CNTL2));
-		if (enable && (adev->cg_flags & AMD_CG_SUPPORT_BIF_LS))
-			data |= PCIE_CNTL2__SLV_MEM_LS_EN_MASK;
-		else
-			data &= ~PCIE_CNTL2__SLV_MEM_LS_EN_MASK;
 
 		if (def != data)
 			WREG32_PCIE_PORT(SOC15_REG_OFFSET(NBIO, 0, regPCIE_CNTL2), data);
 
 		data = RREG32_PCIE_PORT(SOC15_REG_OFFSET(NBIO, 0, regBIF1_PCIE_TX_POWER_CTRL_1));
 		def = data;
-		if (enable && (adev->cg_flags & AMD_CG_SUPPORT_BIF_LS))
-			data |= (BIF1_PCIE_TX_POWER_CTRL_1__MST_MEM_LS_EN_MASK |
-				BIF1_PCIE_TX_POWER_CTRL_1__REPLAY_MEM_LS_EN_MASK);
-		else
-			data &= ~(BIF1_PCIE_TX_POWER_CTRL_1__MST_MEM_LS_EN_MASK |
-				BIF1_PCIE_TX_POWER_CTRL_1__REPLAY_MEM_LS_EN_MASK);
 
 		if (def != data)
 			WREG32_PCIE_PORT(SOC15_REG_OFFSET(NBIO, 0, regBIF1_PCIE_TX_POWER_CTRL_1),
 				data);
 	} else {
 		def = data = RREG32_PCIE_PORT(SOC15_REG_OFFSET(NBIO, 0, regPCIE_CNTL2));
-		if (enable && (adev->cg_flags & AMD_CG_SUPPORT_BIF_LS))
-			data |= (PCIE_CNTL2__SLV_MEM_LS_EN_MASK |
-				 PCIE_CNTL2__MST_MEM_LS_EN_MASK |
-				 PCIE_CNTL2__REPLAY_MEM_LS_EN_MASK);
-		else
-			data &= ~(PCIE_CNTL2__SLV_MEM_LS_EN_MASK |
-				  PCIE_CNTL2__MST_MEM_LS_EN_MASK |
-				  PCIE_CNTL2__REPLAY_MEM_LS_EN_MASK);
 
 		if (def != data)
 			WREG32_PCIE_PORT(SOC15_REG_OFFSET(NBIO, 0, regPCIE_CNTL2), data);

@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Advanced Micro Devices, Inc.
+ * Copyright 2015, 2019-2021 Advanced Micro Devices, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -24,11 +24,20 @@
 #include <linux/kthread.h>
 #include <linux/wait.h>
 #include <linux/sched.h>
+#include <linux/pm_runtime.h>
 
 #include <drm/drm_drv.h>
 
 #include "amdgpu.h"
 #include "amdgpu_trace.h"
+#include "amdgpu_sws.h"
+
+#include "sgpu_profiler.h"
+
+#ifdef CONFIG_DRM_SGPU_EXYNOS
+#include "exynos_gpu_interface.h"
+#include <soc/samsung/exynos/debug-snapshot.h>
+#endif /* CONFIG_DRM_SGPU_EXYNOS */
 
 static enum drm_gpu_sched_stat amdgpu_job_timedout(struct drm_sched_job *s_job)
 {
@@ -38,12 +47,64 @@ static enum drm_gpu_sched_stat amdgpu_job_timedout(struct drm_sched_job *s_job)
 	struct amdgpu_device *adev = ring->adev;
 	int idx;
 
+	if (atomic_read(&adev->on_recovery))
+		return DRM_GPU_SCHED_STAT_NOMINAL;
+
+	atomic_inc(&adev->on_recovery);
+
+	if (adev->runpm) {
+		pm_runtime_get_sync(adev->ddev.dev);
+		vangogh_lite_ifpo_power_on(adev);
+	}
+
 	if (!drm_dev_enter(&adev->ddev, &idx)) {
 		DRM_INFO("%s - device unplugged skipping recovery on scheduler:%s",
 			 __func__, s_job->sched->name);
 
 		/* Effectively the job is aborted as the device is gone */
 		return DRM_GPU_SCHED_STAT_ENODEV;
+	}
+
+	if (ring->funcs->check_ring_done && s_job->s_fence->parent) {
+		struct dma_fence *fence= s_job->s_fence->parent;
+
+		job = to_amdgpu_job(s_job);
+		DRM_INFO("%s: vmid %u job_id %lld FENCE drm %lld/%lld/%lld sgpu %lld/%lld\n",
+			 ring->name, job->vmid, s_job->id,
+			 s_job->s_fence->scheduled.context,
+			 s_job->s_fence->finished.context,
+			 s_job->s_fence->finished.seqno,
+			 fence->context, fence->seqno);
+
+		SGPU_LOG(adev, DMSG_INFO, DMSG_ETC,
+			"%s: vmid %u job_id %lld FENCE drm %lld/%lld/%lld sgpu %lld/%lld\n",
+			 ring->name, job->vmid, s_job->id,
+			 s_job->s_fence->scheduled.context,
+			 s_job->s_fence->finished.context,
+			 s_job->s_fence->finished.seqno,
+			 fence->context, fence->seqno);
+
+		ring->funcs->check_ring_done(ring);
+	}
+
+	if (sgpu_jobtimeout_to_panic) {
+		list_add(&s_job->list, &s_job->sched->pending_list);
+#ifdef CONFIG_DRM_SGPU_EXYNOS
+		dbg_snapshot_expire_watchdog();
+#else /* CONFIG_DRM_SGPU_EXYNOS */
+		panic("%s panic\n", __func__);
+#endif /* CONFIG_DRM_SGPU_EXYNOS */
+	}
+
+	if (amdgpu_fault_detect) {
+		if (test_bit(FAULT_DETECT_RUNNING,
+				&adev->fault_detect_flags)) {
+			set_bit(FAULT_DETECT_JOB_TIMEOUT,
+					&adev->fault_detect_flags);
+			set_bit(FAULT_DETECT_WAKEUP,
+					&adev->fault_detect_flags);
+			wake_up(&adev->fault_detect_wake_up);
+		}
 	}
 
 	memset(&ti, 0, sizeof(struct amdgpu_task_info));
@@ -57,7 +118,8 @@ static enum drm_gpu_sched_stat amdgpu_job_timedout(struct drm_sched_job *s_job)
 
 	amdgpu_vm_get_task_info(ring->adev, job->pasid, &ti);
 	DRM_ERROR("ring %s timeout, signaled seq=%u, emitted seq=%u\n",
-		  job->base.sched->name, atomic_read(&ring->fence_drv.last_seq),
+		  job->base.sched->name,
+		  atomic_read(&ring->fence_drv.last_seq),
 		  ring->fence_drv.sync_seq);
 	DRM_ERROR("Process information: process %s pid %d thread %s pid %d\n",
 		  ti.process_name, ti.tgid, ti.task_name, ti.pid);
@@ -70,8 +132,15 @@ static enum drm_gpu_sched_stat amdgpu_job_timedout(struct drm_sched_job *s_job)
 			adev->virt.tdr_debug = true;
 	}
 
+	if (adev->runpm) {
+		vangogh_lite_ifpo_count_decrease(ring->adev);
+		pm_runtime_mark_last_busy(adev->ddev.dev);
+		pm_runtime_put_autosuspend(adev->ddev.dev);
+	}
+
 exit:
 	drm_dev_exit(idx);
+	atomic_set(&adev->on_recovery, 0);
 	return DRM_GPU_SCHED_STAT_NOMINAL;
 }
 
@@ -103,6 +172,8 @@ int amdgpu_job_alloc(struct amdgpu_device *adev, unsigned num_ibs,
 	(*job)->vram_lost_counter = atomic_read(&adev->vram_lost_counter);
 	(*job)->vm_pd_addr = AMDGPU_BO_INVALID_OFFSET;
 
+	(*job)->end_of_frame = false;
+
 	return 0;
 }
 
@@ -121,6 +192,134 @@ int amdgpu_job_alloc_with_ib(struct amdgpu_device *adev, unsigned size,
 		kfree(*job);
 
 	return r;
+}
+
+static void amdgpu_job_wa_pc_rings(struct amdgpu_ctx *ctx,
+				   struct amdgpu_ib *ib)
+{
+	if (ib->flags & AMDGPU_IB_FLAG_PERF_COUNTER) {
+		if (ib->ip_type == AMDGPU_HW_IP_GFX)
+			ctx->pc_gfx_rings |= (1 << ib->ring);
+		else if (ib->ip_type == AMDGPU_HW_IP_COMPUTE)
+			ctx->pc_compute_rings |= (1 << ib->ring);
+	} else {
+		if (ib->ip_type == AMDGPU_HW_IP_GFX)
+			ctx->pc_gfx_rings &= ~(1 << ib->ring);
+		else if (ib->ip_type == AMDGPU_HW_IP_COMPUTE)
+			ctx->pc_compute_rings &= ~(1 << ib->ring);
+	}
+}
+
+static void amdgpu_job_wa_sqtt_rings(struct amdgpu_ctx *ctx,
+				     struct amdgpu_ib *ib)
+{
+	if (ib->flags & AMDGPU_IB_FLAG_SQ_THREAD_TRACE) {
+		if (ib->ip_type == AMDGPU_HW_IP_GFX)
+			ctx->sqtt_gfx_rings |= (1 << ib->ring);
+		else if (ib->ip_type == AMDGPU_HW_IP_COMPUTE)
+			ctx->sqtt_compute_rings |= (1 << ib->ring);
+	} else {
+		if (ib->ip_type == AMDGPU_HW_IP_GFX)
+			ctx->sqtt_gfx_rings &= ~(1 << ib->ring);
+		else if (ib->ip_type == AMDGPU_HW_IP_COMPUTE)
+			ctx->sqtt_compute_rings &= ~(1 << ib->ring);
+	}
+}
+
+static void amdgpu_job_track_pc_sqtt(struct amdgpu_device *adev,
+				     struct amdgpu_job *job)
+{
+	struct amdgpu_ctx *ctx = job->ctx;
+	struct amdgpu_ib *ib;
+	bool old_rings, new_rings;
+	int i;
+
+	job->pc_wa_enable = job->pc_wa_disable = false;
+	job->sqtt_wa_enable = job->sqtt_wa_disable = false;
+	for (i = 0; i < job->num_ibs; i++) {
+		ib = &job->ibs[i];
+
+		/* Are there any rings that have pc active */
+		old_rings = (ctx->pc_gfx_rings || ctx->pc_compute_rings);
+		amdgpu_job_wa_pc_rings(ctx, ib);
+		new_rings = (ctx->pc_gfx_rings || ctx->pc_compute_rings);
+		/* If old and new is not equal, it means there is a change
+		 * in Perfcount active/inactive. */
+		if (old_rings != new_rings) {
+			/* If new_rings is true, enable workaround for this job.
+			 * If new_rings is false, disable workaround after this job.*/
+			if (new_rings) {
+				job->pc_wa_enable = true;
+				job->pc_wa_disable = false;
+			} else
+				job->pc_wa_disable = true;
+		}
+
+		old_rings = (ctx->sqtt_gfx_rings || ctx->sqtt_compute_rings);
+		amdgpu_job_wa_sqtt_rings(ctx, ib);
+		new_rings = (ctx->sqtt_gfx_rings || ctx->sqtt_compute_rings);
+		if (old_rings != new_rings) {
+			if (new_rings) {
+				job->sqtt_wa_enable = true;
+				job->sqtt_wa_disable = false;
+			} else
+				job->sqtt_wa_disable = true;
+		}
+	}
+}
+
+static void amdgpu_job_pc_workaround_enable(struct amdgpu_ring *ring)
+{
+	struct amdgpu_device *adev = ring->adev;
+
+	/* if adev->pc_count is 0, workaround is disabled.
+	 * Enable the workaround. */
+	if (atomic_read(&adev->pc_count) == 0)
+		amdgpu_gfx_sw_workaround(adev, WA_CG_PERFCOUNTER, 1);
+	atomic_inc(&adev->pc_count);
+}
+
+static void amdgpu_job_pc_workaround_disable(struct amdgpu_ring *ring)
+{
+	struct amdgpu_device *adev = ring->adev;
+
+	if (atomic_read(&adev->pc_count) == 0) {
+		DRM_ERROR("Tracking Perfcounter active/inactive out of bound\n");
+		return;
+	}
+
+	atomic_dec(&adev->pc_count);
+	/* if adev->pc_count become 0, workaround is enabled.
+	 * Disable the workaround. */
+	if (atomic_read(&adev->pc_count) == 0)
+		amdgpu_gfx_sw_workaround(adev, WA_CG_PERFCOUNTER, 0);
+}
+
+static void amdgpu_job_sqtt_workaround_enable(struct amdgpu_ring *ring)
+{
+	struct amdgpu_device *adev = ring->adev;
+
+	/* if adev->sqtt_count is 0, workaround is disabled.
+	 * Enable the workaround. */
+	if (atomic_read(&adev->sqtt_count) == 0)
+		amdgpu_gfx_sw_workaround(adev, WA_CG_SQ_THREAD_TRACE, 1);
+	atomic_inc(&adev->sqtt_count);
+}
+
+static void amdgpu_job_sqtt_workaround_disable(struct amdgpu_ring *ring)
+{
+	struct amdgpu_device *adev = ring->adev;
+
+	if (atomic_read(&adev->sqtt_count) == 0) {
+		DRM_ERROR("Tracking SQTT active/inactive out of bound\n");
+		return;
+	}
+
+	atomic_dec(&adev->sqtt_count);
+	/* if adev->sqtt_count become 0, workaround is enabled.
+	 * Disable the workaround. */
+	if (atomic_read(&adev->sqtt_count) == 0)
+		amdgpu_gfx_sw_workaround(adev, WA_CG_SQ_THREAD_TRACE, 0);
 }
 
 void amdgpu_job_free_resources(struct amdgpu_job *job)
@@ -143,18 +342,91 @@ void amdgpu_job_free_resources(struct amdgpu_job *job)
 
 static void amdgpu_job_free_cb(struct drm_sched_job *s_job)
 {
+	struct amdgpu_ring *ring = to_amdgpu_ring(s_job->sched);
+	struct amdgpu_device *adev = ring->adev;
 	struct amdgpu_job *job = to_amdgpu_job(s_job);
+	ktime_t scheduled, finished;
+	bool fault_detect_notify = false;
+
+	if (amdgpu_fault_detect) {
+		if (ring->funcs->type == AMDGPU_RING_TYPE_GFX &&
+		    (atomic_dec_return(&adev->gfx_job_cnt) == 0)) {
+			clear_bit(FAULT_DETECT_GFX_ACTIVE,
+				  &adev->fault_detect_flags);
+			fault_detect_notify = true;
+		} else if (ring->funcs->type == AMDGPU_RING_TYPE_COMPUTE &&
+			   (atomic_dec_return(&adev->compute_job_cnt)
+			    == 0)) {
+			clear_bit(FAULT_DETECT_COMPUTE_ACTIVE,
+				  &adev->fault_detect_flags);
+			fault_detect_notify = true;
+		}
+
+		/* If both GFX and Compute are idle inform to fault detect */
+		if (fault_detect_notify
+		    && (!test_bit(FAULT_DETECT_GFX_ACTIVE,
+				  &adev->fault_detect_flags) &&
+			!test_bit(FAULT_DETECT_COMPUTE_ACTIVE,
+				  &adev->fault_detect_flags))) {
+
+			set_bit(FAULT_DETECT_WAKEUP,
+				&adev->fault_detect_flags);
+			wake_up(&adev->fault_detect_wake_up);
+		}
+	}
+
+	if (sgpu_unscheduled_job_debug)
+		cancel_work_sync(&job->wait_on_scheduled_work);
+
+	if (sgpu_amigo_user_time &&
+	    ring->funcs->type == AMDGPU_RING_TYPE_GFX) {
+		scheduled = s_job->s_fence->scheduled.timestamp;
+		finished = s_job->s_fence->finished.timestamp;
+
+		profiler_interframe_hw_update(scheduled,
+						  finished,
+						  job->end_of_frame);
+	}
+
+	SGPU_LOG(adev, DMSG_INFO, DMSG_ETC,
+		 "%s-%d: vmid=%u, pasid=%u, drm %llu/%llu/%llu",
+		 ring->name, job->base.id, job->vmid, job->pasid,
+		 job->base.s_fence->scheduled.context,
+		 job->base.s_fence->finished.context,
+		 job->base.s_fence->finished.seqno);
+
+	if (ring->sws_ctx.ctx && ring->sws_ctx.ctx->secure_mode && amdgpu_tmz)
+		amdgpu_sws_put_tmz_queue(ring->sws_ctx.ctx,
+					 &job->base.s_fence->finished);
 
 	drm_sched_job_cleanup(s_job);
 
 	amdgpu_sync_free(&job->sync);
 	amdgpu_sync_free(&job->sched_sync);
 
+	/* Is workaround not needed after this job */
+	if (adev->asic_type == CHIP_VANGOGH_LITE) {
+		mutex_lock(&adev->pc_sqtt_mutex);
+		if (job->pc_wa_disable)
+			amdgpu_job_pc_workaround_disable(ring);
+		if (job->sqtt_wa_disable)
+			amdgpu_job_sqtt_workaround_disable(ring);
+		mutex_unlock(&adev->pc_sqtt_mutex);
+	}
+
     /* only put the hw fence if has embedded fence */
 	if (job->hw_fence.ops != NULL)
 		dma_fence_put(&job->hw_fence);
 	else
 		kfree(job);
+
+	if (adev->runpm) {
+		mutex_lock(&adev->ifpo_mutex);
+		if (atomic_read(&adev->in_ifpo) == 0 &&
+				adev->ifpo_runtime_control)
+			vangogh_lite_ifpo_power_off(adev);
+		mutex_unlock(&adev->ifpo_mutex);
+	}
 }
 
 void amdgpu_job_free(struct amdgpu_job *job)
@@ -201,6 +473,13 @@ int amdgpu_job_submit_direct(struct amdgpu_job *job, struct amdgpu_ring *ring,
 	if (r)
 		return r;
 
+	/* update ring fence seq by SW */
+	if (job->ifh_mode &&
+	    (ring->funcs->type == AMDGPU_RING_TYPE_GFX ||
+	     ring->funcs->type == AMDGPU_RING_TYPE_SDMA ||
+	     ring->funcs->type == AMDGPU_RING_TYPE_COMPUTE))
+		amdgpu_fence_driver_force_completion(ring);
+
 	amdgpu_job_free(job);
 	dma_fence_put(*fence);
 
@@ -233,15 +512,36 @@ static struct dma_fence *amdgpu_job_dependency(struct drm_sched_job *sched_job,
 		fence = amdgpu_sync_get_fence(&job->sync);
 	}
 
+	/* get fence on tmz queue after vmid is ready */
+	if (!fence && vm && job->vmid && job->ctx->secure_mode && amdgpu_tmz) {
+		r = amdgpu_sws_get_tmz_queue(ring,
+					     &job->base.s_fence->finished,
+					     job);
+
+		if (r)
+			DRM_ERROR("Error getting tmz queue (%d)\n", r);
+
+		fence = amdgpu_sync_get_fence(&job->sync);
+	}
+
 	return fence;
 }
 
 static struct dma_fence *amdgpu_job_run(struct drm_sched_job *sched_job)
 {
 	struct amdgpu_ring *ring = to_amdgpu_ring(sched_job->sched);
+	struct amdgpu_device *adev = ring->adev;
 	struct dma_fence *fence = NULL, *finished;
 	struct amdgpu_job *job;
 	int r = 0;
+
+	if (adev->runpm) {
+		r = pm_runtime_get_sync(adev->ddev.dev);
+		if (r < 0)
+		    goto pm_put;
+		r = 0;
+		vangogh_lite_ifpo_power_on(adev);
+	}
 
 	job = to_amdgpu_job(sched_job);
 	finished = &job->base.s_fence->finished;
@@ -250,16 +550,78 @@ static struct dma_fence *amdgpu_job_run(struct drm_sched_job *sched_job)
 
 	trace_amdgpu_sched_run_job(job);
 
+	/* Is workaround needed for this job */
+	if (adev->asic_type == CHIP_VANGOGH_LITE) {
+		if (!amdgpu_in_reset(adev)) {
+			mutex_lock(&adev->pc_sqtt_mutex);
+			amdgpu_job_track_pc_sqtt(adev, job);
+			if (job->pc_wa_enable)
+				amdgpu_job_pc_workaround_enable(ring);
+			if (job->sqtt_wa_enable)
+				amdgpu_job_sqtt_workaround_enable(ring);
+			mutex_unlock(&adev->pc_sqtt_mutex);
+		}
+	}
+
 	if (job->vram_lost_counter != atomic_read(&ring->adev->vram_lost_counter))
 		dma_fence_set_error(finished, -ECANCELED);/* skip IB as well if VRAM lost */
 
 	if (finished->error < 0) {
 		DRM_INFO("Skip scheduling IBs!\n");
+		dma_fence_signal(finished);
+	} else if (job->vm->process_flags == PF_EXITING) {
+		DRM_INFO("Skip scheduling IBs PF_EXITING!\n");
+		dma_fence_set_error(finished, -ENOEXEC);
+		dma_fence_signal(finished);
 	} else {
 		r = amdgpu_ib_schedule(ring, job->num_ibs, job->ibs, job,
 				       &fence);
-		if (r)
+		if (r) {
 			DRM_ERROR("Error scheduling IBs (%d)\n", r);
+		} else {
+			if (amdgpu_fault_detect) {
+				if (ring->funcs->type ==
+						AMDGPU_RING_TYPE_GFX) {
+
+					atomic_inc(&adev->gfx_job_cnt);
+
+					set_bit(
+					FAULT_DETECT_GFX_ACTIVE,
+					&adev->fault_detect_flags);
+
+					if (!test_bit(FAULT_DETECT_RUNNING,
+						&adev->fault_detect_flags)) {
+
+						set_bit(
+						FAULT_DETECT_WAKEUP,
+						&adev->fault_detect_flags
+						);
+
+						wake_up(
+						&adev->fault_detect_wake_up);
+					}
+				} else if (ring->funcs->type
+						== AMDGPU_RING_TYPE_COMPUTE) {
+
+					atomic_inc(&adev->compute_job_cnt);
+
+					set_bit(
+					FAULT_DETECT_COMPUTE_ACTIVE,
+					&adev->fault_detect_flags);
+
+					if (!test_bit(FAULT_DETECT_RUNNING,
+						&adev->fault_detect_flags)) {
+
+						set_bit(
+						FAULT_DETECT_WAKEUP,
+						&adev->fault_detect_flags);
+
+						wake_up(
+						&adev->fault_detect_wake_up);
+					}
+				}
+			}
+		}
 	}
 
 	if (!job->job_run_counter)
@@ -269,7 +631,20 @@ static struct dma_fence *amdgpu_job_run(struct drm_sched_job *sched_job)
 	job->job_run_counter++;
 	amdgpu_job_free_resources(job);
 
+	/* update ring fence seq by SW */
+	if (job->ifh_mode &&
+	    (ring->funcs->type == AMDGPU_RING_TYPE_GFX ||
+	     ring->funcs->type == AMDGPU_RING_TYPE_SDMA ||
+	     ring->funcs->type == AMDGPU_RING_TYPE_COMPUTE))
+		amdgpu_fence_driver_force_completion(ring);
+
 	fence = r ? ERR_PTR(r) : fence;
+pm_put:
+	if (adev->runpm) {
+		vangogh_lite_ifpo_count_decrease(adev);
+		pm_runtime_put_autosuspend(adev->ddev.dev);
+	}
+
 	return fence;
 }
 

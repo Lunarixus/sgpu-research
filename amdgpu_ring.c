@@ -1,5 +1,5 @@
 /*
- * Copyright 2008 Advanced Micro Devices, Inc.
+ * Copyright 2008-2020 Advanced Micro Devices, Inc.
  * Copyright 2008 Red Hat Inc.
  * Copyright 2009 Jerome Glisse.
  *
@@ -34,6 +34,7 @@
 #include <drm/amdgpu_drm.h>
 #include "amdgpu.h"
 #include "atom.h"
+#include "amdgpu_cwsr.h"
 
 /*
  * Rings
@@ -265,9 +266,18 @@ int amdgpu_ring_init(struct amdgpu_device *adev, struct amdgpu_ring *ring,
 
 	if (!ring->no_scheduler) {
 		hw_ip = ring->funcs->type;
-		num_sched = &adev->gpu_sched[hw_ip][hw_prio].num_scheds;
-		adev->gpu_sched[hw_ip][hw_prio].sched[(*num_sched)++] =
-			&ring->sched;
+
+		/* Do not assign scheduler attached to Ring0 on the basis of
+		 * priority. Ring0 is reserved for ACE tunnel and scheduler
+		 * attached to Ring0 will be assigned on the basis of ctx
+		 * priority.
+		 */
+		if (!(hw_ip == AMDGPU_HW_IP_COMPUTE && ring->me == 1 &&
+		      ring->pipe == 0 && ring->queue == 0)) {
+			num_sched = &adev->gpu_sched[hw_ip][hw_prio].num_scheds;
+			adev->gpu_sched[hw_ip][hw_prio].sched[(*num_sched)++] =
+				&ring->sched;
+		}
 	}
 
 	return 0;
@@ -340,7 +350,8 @@ bool amdgpu_ring_soft_recovery(struct amdgpu_ring *ring, unsigned int vmid,
 {
 	ktime_t deadline = ktime_add_us(ktime_get(), 10000);
 
-	if (amdgpu_sriov_vf(ring->adev) || !ring->funcs->soft_recovery || !fence)
+	if (amdgpu_sriov_vf(ring->adev) || !ring->funcs->soft_recovery || !fence ||
+	    !amdgpu_gpu_recovery)
 		return false;
 
 	atomic_inc(&ring->adev->gpu_reset_counter);
@@ -407,10 +418,74 @@ static ssize_t amdgpu_debugfs_ring_read(struct file *f, char __user *buf,
 	return result;
 }
 
+ssize_t amdgpu_debugfs_ring_write(struct file *file,
+				  const char __user *buf,
+				  size_t len, loff_t *ppos)
+{
+	struct amdgpu_ring *ring = file_inode(file)->i_private;
+	char local_buf[256];
+	size_t size;
+	int r = 0;
+	u32 val;
+
+	if (!ring || !ring->cwsr) {
+		DRM_INFO("current ring can not support dequeue and relaunch\n");
+		return len;
+	}
+
+	size = min(sizeof(local_buf) - 1, len);
+	if (copy_from_user(local_buf, buf, size)) {
+		DRM_WARN("failed to copy buf from user space\n");
+		return len;
+	}
+
+	local_buf[size] = '\0';
+	r = kstrtou32(local_buf, 0, &val);
+	if (r)
+		return r;
+
+	//1: dequeue; 2: re-launch; 3: dequeue, sleep 1 second and relaunch
+	switch (val) {
+	case 1:
+		r = amdgpu_cwsr_dequeue(ring);
+		break;
+
+	case 2:
+		r = amdgpu_cwsr_relaunch(ring);
+		break;
+
+	case 3:
+		r = amdgpu_cwsr_dequeue(ring);
+		if (r)
+			break;
+
+		msleep(1000);
+		r = amdgpu_cwsr_relaunch(ring);
+		break;
+
+	default:
+		DRM_WARN("command is not supported\n");
+	}
+
+	if (r == 0)
+		r = len;
+	return r;
+}
+
+int local_release(struct inode *inode, struct file *file)
+{
+	struct amdgpu_ring *ring = file_inode(file)->i_private;
+
+	i_size_write(inode, ring->ring_size + 12);
+	return 0;
+}
+
 static const struct file_operations amdgpu_debugfs_ring_fops = {
 	.owner = THIS_MODULE,
 	.read = amdgpu_debugfs_ring_read,
-	.llseek = default_llseek
+	.write   = amdgpu_debugfs_ring_write,
+	.llseek = default_llseek,
+	.release = local_release,
 };
 
 #endif
@@ -437,6 +512,13 @@ int amdgpu_debugfs_ring_init(struct amdgpu_device *adev,
 	return 0;
 }
 
+void amdgpu_debugfs_ring_fini(struct amdgpu_ring *ring)
+{
+#if defined(CONFIG_DEBUG_FS)
+	debugfs_remove(ring->ent);
+#endif
+}
+
 /**
  * amdgpu_ring_test_helper - tests ring and set sched readiness status
  *
@@ -451,13 +533,16 @@ int amdgpu_ring_test_helper(struct amdgpu_ring *ring)
 	struct amdgpu_device *adev = ring->adev;
 	int r;
 
+	if (amdgpu_device_skip_hw_access(adev))
+		return 0;
+
 	r = amdgpu_ring_test_ring(ring);
 	if (r)
 		DRM_DEV_ERROR(adev->dev, "ring %s test failed (%d)\n",
 			      ring->name, r);
 	else
 		DRM_DEV_DEBUG(adev->dev, "ring test on %s succeeded\n",
-			      ring->name);
+			     ring->name);
 
 	ring->sched.ready = !r;
 	return r;

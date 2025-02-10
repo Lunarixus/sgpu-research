@@ -2,6 +2,8 @@
  * Copyright 2009 Jerome Glisse.
  * All Rights Reserved.
  *
+ * Copyright 2020 Advanced Micro Devices, Inc.
+ *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the
  * "Software"), to deal in the Software without restriction, including
@@ -77,11 +79,13 @@ void amdgpu_fence_slab_fini(void)
  * Cast helper
  */
 static const struct dma_fence_ops amdgpu_fence_ops;
+static const struct dma_fence_ops amdgpu_job_fence_ops;
 static inline struct amdgpu_fence *to_amdgpu_fence(struct dma_fence *f)
 {
 	struct amdgpu_fence *__f = container_of(f, struct amdgpu_fence, base);
 
-	if (__f->base.ops == &amdgpu_fence_ops)
+	if (__f->base.ops == &amdgpu_fence_ops ||
+		__f->base.ops == &amdgpu_job_fence_ops)
 		return __f;
 
 	return NULL;
@@ -158,24 +162,39 @@ int amdgpu_fence_emit(struct amdgpu_ring *ring, struct dma_fence **f, struct amd
 	}
 
 	seq = ++ring->fence_drv.sync_seq;
-	if (job != NULL && job->job_run_counter) {
+	if (job && job->job_run_counter) {
 		/* reinit seq for resubmitted jobs */
+		SGPU_LOG(adev, DMSG_INFO, DMSG_ETC,
+			"resubmit %s sgpu %llu/%llu -> %llu/%llu",
+			ring->name, fence->context, fence->seqno,
+			fence->context, seq);
 		fence->seqno = seq;
 	} else {
-		dma_fence_init(fence, &amdgpu_fence_ops,
-				&ring->fence_drv.lock,
-				adev->fence_context + ring->idx,
-				seq);
-	}
-
-	if (job != NULL) {
-		/* mark this fence has a parent job */
-		set_bit(AMDGPU_FENCE_FLAG_EMBED_IN_JOB_BIT, &fence->flags);
+		if (job)
+			dma_fence_init(fence, &amdgpu_job_fence_ops,
+						&ring->fence_drv.lock,
+						adev->fence_context + ring->idx, seq);
+		else
+			dma_fence_init(fence, &amdgpu_fence_ops,
+						&ring->fence_drv.lock,
+						adev->fence_context + ring->idx, seq);
 	}
 
 	amdgpu_ring_emit_fence(ring, ring->fence_drv.gpu_addr,
 			       seq, flags | AMDGPU_FENCE_FLAG_INT);
-	pm_runtime_get_noresume(adev_to_drm(adev)->dev);
+
+	SGPU_LOG(adev, DMSG_INFO, DMSG_ETC,
+		"%s drm %llu/%llu/%llu sgpu %llu/%llu", ring->name,
+		(job) ? job->base.s_fence->scheduled.context : 0,
+		(job) ? job->base.s_fence->finished.context : 0,
+		(job) ? job->base.s_fence->finished.seqno : 0,
+		fence->context, fence->seqno);
+
+    if (adev->runpm) {
+		atomic_inc(&ring->adev->in_ifpo);
+		pm_runtime_get_noresume(adev_to_drm(adev)->dev);
+	}
+
 	ptr = &ring->fence_drv.fences[seq & ring->fence_drv.num_fences_mask];
 	if (unlikely(rcu_dereference_protected(*ptr, 1))) {
 		struct dma_fence *old;
@@ -246,6 +265,9 @@ int amdgpu_fence_emit_polling(struct amdgpu_ring *ring, uint32_t *s,
  */
 static void amdgpu_fence_schedule_fallback(struct amdgpu_ring *ring)
 {
+	if (sgpu_no_timeout != 0)
+		return;
+
 	mod_timer(&ring->fence_drv.fallback_timer,
 		  jiffies + AMDGPU_FENCE_JIFFIES_TIMEOUT);
 }
@@ -266,7 +288,9 @@ bool amdgpu_fence_process(struct amdgpu_ring *ring)
 	struct amdgpu_fence_driver *drv = &ring->fence_drv;
 	struct amdgpu_device *adev = ring->adev;
 	uint32_t seq, last_seq;
+	uint32_t seq_save, last_seq_save;
 	int r;
+	bool cu_job = false;
 
 	do {
 		last_seq = atomic_read(&ring->fence_drv.last_seq);
@@ -278,8 +302,23 @@ bool amdgpu_fence_process(struct amdgpu_ring *ring)
 	    seq != ring->fence_drv.sync_seq)
 		amdgpu_fence_schedule_fallback(ring);
 
+	if (ring->use_pollfence)
+		if (seq != ring->fence_drv.sync_seq)
+			queue_work(ring->wq_fence, &ring->poll_fence_work);
+
 	if (unlikely(seq == last_seq))
 		return false;
+
+#ifdef CONFIG_PM_DEVFREQ
+	if (sgpu_enable_dvfs) {
+		cu_job = (ring->funcs->type == AMDGPU_RING_TYPE_COMPUTE);
+		sgpu_utilization_job_end(ring->adev->devfreq,
+					 seq - last_seq, cu_job);
+	}
+#endif /* CONFIG_PM_DEVFREQ */
+
+	seq_save = seq;
+	last_seq_save = last_seq;
 
 	last_seq &= drv->num_fences_mask;
 	seq &= drv->num_fences_mask;
@@ -288,6 +327,8 @@ bool amdgpu_fence_process(struct amdgpu_ring *ring)
 		struct dma_fence *fence, **ptr;
 
 		++last_seq;
+		++last_seq_save;
+
 		last_seq &= drv->num_fences_mask;
 		ptr = &drv->fences[last_seq];
 
@@ -298,6 +339,8 @@ bool amdgpu_fence_process(struct amdgpu_ring *ring)
 		if (!fence)
 			continue;
 
+		vangogh_lite_ifpo_count_decrease(adev);
+
 		r = dma_fence_signal(fence);
 		if (!r)
 			DMA_FENCE_TRACE(fence, "signaled from irq context\n");
@@ -305,8 +348,17 @@ bool amdgpu_fence_process(struct amdgpu_ring *ring)
 			BUG();
 
 		dma_fence_put(fence);
-		pm_runtime_mark_last_busy(adev_to_drm(adev)->dev);
-		pm_runtime_put_autosuspend(adev_to_drm(adev)->dev);
+		if (ring->adev->runpm) {
+			pm_runtime_mark_last_busy(adev_to_drm(adev)->dev);
+			pm_runtime_put_autosuspend(adev_to_drm(adev)->dev);
+		}
+
+		SGPU_LOG(ring->adev, DMSG_INFO, DMSG_ETC,
+			"ifpo(%d) pm(%d) seq/last_seq %u/%u sgpu %llu/%llu",
+			atomic_read(&adev->in_ifpo),
+			adev->dev->power.usage_count,
+			seq_save, last_seq_save, fence->context, fence->seqno);
+
 	} while (last_seq != seq);
 
 	return true;
@@ -329,6 +381,30 @@ static void amdgpu_fence_fallback(struct timer_list *t)
 }
 
 /**
+ * amdgpu_fence_poll_fence - poll fence instead of waiting for hardware interrupts
+ *
+ * @work: delayed work item
+ *
+ * TODO add timeout
+ */
+static void amdgpu_fence_poll_fence(struct work_struct *work)
+{
+	struct amdgpu_ring *ring = container_of(work, struct amdgpu_ring, poll_fence_work);
+	uint32_t seq, last_seq;
+
+	do {
+		last_seq = atomic_read(&ring->fence_drv.last_seq);
+		seq = amdgpu_fence_read(ring);
+		if (seq == last_seq)
+			schedule();
+		else
+			break;
+	} while (1);
+
+	amdgpu_fence_process(ring);
+}
+
+/**
  * amdgpu_fence_wait_empty - wait for all fences to signal
  *
  * @ring: ring index the fence is associated with
@@ -341,6 +417,7 @@ int amdgpu_fence_wait_empty(struct amdgpu_ring *ring)
 	uint64_t seq = READ_ONCE(ring->fence_drv.sync_seq);
 	struct dma_fence *fence, **ptr;
 	int r;
+	unsigned int timeout = 1000000;
 
 	if (!seq)
 		return 0;
@@ -353,10 +430,23 @@ int amdgpu_fence_wait_empty(struct amdgpu_ring *ring)
 		return 0;
 	}
 	rcu_read_unlock();
+	do {
+		r = dma_fence_get_status(fence);
+		udelay(5);
+		timeout -= 5;
+	} while (r == 0 && timeout > 0);
 
-	r = dma_fence_wait(fence, false);
 	dma_fence_put(fence);
-	return r;
+
+	if (r > 0)
+		return 0;
+
+	if (timeout <= 0) {
+		DRM_ERROR("dma_fence_wait timeout\n");
+		return -EBUSY;
+	}
+
+	return -EINVAL;
 }
 
 /**
@@ -462,6 +552,7 @@ int amdgpu_fence_driver_init_ring(struct amdgpu_ring *ring,
 				  atomic_t *sched_score)
 {
 	struct amdgpu_device *adev = ring->adev;
+	char wq_name[64];
 	long timeout;
 	int r;
 
@@ -470,7 +561,6 @@ int amdgpu_fence_driver_init_ring(struct amdgpu_ring *ring,
 
 	if (!is_power_of_2(num_hw_submission))
 		return -EINVAL;
-
 	ring->fence_drv.cpu_addr = NULL;
 	ring->fence_drv.gpu_addr = 0;
 	ring->fence_drv.sync_seq = 0;
@@ -483,6 +573,7 @@ int amdgpu_fence_driver_init_ring(struct amdgpu_ring *ring,
 	spin_lock_init(&ring->fence_drv.lock);
 	ring->fence_drv.fences = kcalloc(num_hw_submission * 2, sizeof(void *),
 					 GFP_KERNEL);
+
 	if (!ring->fence_drv.fences)
 		return -ENOMEM;
 
@@ -505,6 +596,9 @@ int amdgpu_fence_driver_init_ring(struct amdgpu_ring *ring,
 		break;
 	}
 
+	if (sgpu_no_timeout != 0)
+		timeout = MAX_SCHEDULE_TIMEOUT;
+
 	r = drm_sched_init(&ring->sched, &amdgpu_sched_ops,
 			   num_hw_submission, amdgpu_job_hang_limit,
 			   timeout, NULL, sched_score, ring->name);
@@ -514,7 +608,50 @@ int amdgpu_fence_driver_init_ring(struct amdgpu_ring *ring,
 		return r;
 	}
 
+	if (ring->use_pollfence) {
+		sprintf(wq_name, "%s_fence_wq", ring->name);
+		ring->wq_fence = alloc_workqueue(wq_name, WQ_UNBOUND,
+						 WQ_UNBOUND_MAX_ACTIVE);
+		if (IS_ERR(ring->wq_fence)) {
+			DRM_ERROR("Failed to create workqueue for %s!\n",
+				  wq_name);
+			return PTR_ERR(ring->wq_fence);
+		}
+
+		INIT_WORK(&ring->poll_fence_work, amdgpu_fence_poll_fence);
+		DRM_INFO("Use fence polling for ring %s\n", ring->name);
+	}
+
 	return 0;
+}
+
+void amdgpu_fence_driver_deinit_ring(struct amdgpu_ring *ring)
+{
+	int r, j;
+
+	if (!ring || !ring->fence_drv.initialized)
+		return;
+
+	r = amdgpu_fence_wait_empty(ring);
+	if (r)
+		/* no need to trigger GPU reset as we are unloading */
+		amdgpu_fence_driver_force_completion(ring);
+
+	if (!ring->no_scheduler)
+		drm_sched_fini(&ring->sched);
+
+	if (ring->use_pollfence) {
+		cancel_work_sync(&ring->poll_fence_work);
+		destroy_workqueue(ring->wq_fence);
+	}
+
+	del_timer_sync(&ring->fence_drv.fallback_timer);
+	for (j = 0; j <= ring->fence_drv.num_fences_mask; ++j)
+		dma_fence_put(ring->fence_drv.fences[j]);
+
+	kfree(ring->fence_drv.fences);
+	ring->fence_drv.fences = NULL;
+	ring->fence_drv.initialized = false;
 }
 
 /**
@@ -561,8 +698,7 @@ void amdgpu_fence_driver_hw_fini(struct amdgpu_device *adev)
 		if (r)
 			amdgpu_fence_driver_force_completion(ring);
 
-		if (!drm_dev_is_unplugged(adev_to_drm(adev)) &&
-		    ring->fence_drv.irq_src)
+		if (ring->fence_drv.irq_src)
 			amdgpu_irq_put(adev, ring->fence_drv.irq_src,
 				       ring->fence_drv.irq_type);
 
@@ -580,14 +716,13 @@ void amdgpu_fence_driver_sw_fini(struct amdgpu_device *adev)
 		if (!ring || !ring->fence_drv.initialized)
 			continue;
 
-		/*
-		 * Notice we check for sched.ops since there's some
-		 * override on the meaning of sched.ready by amdgpu.
-		 * The natural check would be sched.ready, which is
-		 * set as drm_sched_init() finishes...
-		 */
-		if (ring->sched.ops)
+		if (!ring->no_scheduler)
 			drm_sched_fini(&ring->sched);
+
+		if (ring->use_pollfence) {
+			cancel_work_sync(&ring->poll_fence_work);
+			destroy_workqueue(ring->wq_fence);
+		}
 
 		for (j = 0; j <= ring->fence_drv.num_fences_mask; ++j)
 			dma_fence_put(ring->fence_drv.fences[j]);
@@ -626,6 +761,25 @@ void amdgpu_fence_driver_hw_init(struct amdgpu_device *adev)
 }
 
 /**
+ * amdgpu_fence_driver_clear_job_fences - clear job embedded fences of ring
+ *
+ * @ring: fence of the ring to be cleared
+ *
+ */
+void amdgpu_fence_driver_clear_job_fences(struct amdgpu_ring *ring)
+{
+	int i;
+	struct dma_fence *old, **ptr;
+
+	for (i = 0; i <= ring->fence_drv.num_fences_mask; i++) {
+		ptr = &ring->fence_drv.fences[i];
+		old = rcu_dereference_protected(*ptr, 1);
+		if (old && old->ops == &amdgpu_job_fence_ops)
+			RCU_INIT_POINTER(*ptr, NULL);
+		}
+}
+
+/**
  * amdgpu_fence_driver_force_completion - force signal latest fence of ring
  *
  * @ring: fence of the ring to signal
@@ -648,16 +802,14 @@ static const char *amdgpu_fence_get_driver_name(struct dma_fence *fence)
 
 static const char *amdgpu_fence_get_timeline_name(struct dma_fence *f)
 {
-	struct amdgpu_ring *ring;
+	return (const char *)to_amdgpu_fence(f)->ring->name;
+}
 
-	if (test_bit(AMDGPU_FENCE_FLAG_EMBED_IN_JOB_BIT, &f->flags)) {
-		struct amdgpu_job *job = container_of(f, struct amdgpu_job, hw_fence);
+static const char *amdgpu_job_fence_get_timeline_name(struct dma_fence *f)
+{
+	struct amdgpu_job *job = container_of(f, struct amdgpu_job, hw_fence);
 
-		ring = to_amdgpu_ring(job->base.sched);
-	} else {
-		ring = to_amdgpu_fence(f)->ring;
-	}
-	return (const char *)ring->name;
+	return (const char *)to_amdgpu_ring(job->base.sched)->name;
 }
 
 /**
@@ -672,18 +824,35 @@ static bool amdgpu_fence_enable_signaling(struct dma_fence *f)
 {
 	struct amdgpu_ring *ring;
 
-	if (test_bit(AMDGPU_FENCE_FLAG_EMBED_IN_JOB_BIT, &f->flags)) {
-		struct amdgpu_job *job = container_of(f, struct amdgpu_job, hw_fence);
-
-		ring = to_amdgpu_ring(job->base.sched);
-	} else {
-		ring = to_amdgpu_fence(f)->ring;
-	}
+	ring = to_amdgpu_fence(f)->ring;
 
 	if (!timer_pending(&ring->fence_drv.fallback_timer))
 		amdgpu_fence_schedule_fallback(ring);
 
-	DMA_FENCE_TRACE(f, "armed on ring %i!\n", ring->idx);
+	if (ring->use_pollfence)
+		queue_work(ring->wq_fence, &ring->poll_fence_work);
+
+	return true;
+}
+
+/**
+ * amdgpu_job_fence_enable_signaling - enable signalling on job fence
+ * @f: fence
+ *
+ * This is the simliar function with amdgpu_fence_enable_signaling above, it
+ * only handles the job embedded fence.
+ */
+static bool amdgpu_job_fence_enable_signaling(struct dma_fence *f)
+{
+	struct amdgpu_ring *ring;
+	struct amdgpu_job *job = container_of(f, struct amdgpu_job, hw_fence);
+	ring = to_amdgpu_ring(job->base.sched);
+
+	if (!timer_pending(&to_amdgpu_ring(job->base.sched)->fence_drv.fallback_timer))
+		amdgpu_fence_schedule_fallback(ring);
+
+	if (ring->use_pollfence)
+		queue_work(ring->wq_fence, &ring->poll_fence_work);
 
 	return true;
 }
@@ -699,19 +868,23 @@ static void amdgpu_fence_free(struct rcu_head *rcu)
 {
 	struct dma_fence *f = container_of(rcu, struct dma_fence, rcu);
 
-	if (test_bit(AMDGPU_FENCE_FLAG_EMBED_IN_JOB_BIT, &f->flags)) {
-	/* free job if fence has a parent job */
-		struct amdgpu_job *job;
-
-		job = container_of(f, struct amdgpu_job, hw_fence);
-		kfree(job);
-	} else {
 	/* free fence_slab if it's separated fence*/
-		struct amdgpu_fence *fence;
+	kmem_cache_free(amdgpu_fence_slab, to_amdgpu_fence(f));
+}
 
-		fence = to_amdgpu_fence(f);
-		kmem_cache_free(amdgpu_fence_slab, fence);
-	}
+/**
+ * amdgpu_job_fence_free - free up the job with embedded fence
+ *
+ * @rcu: RCU callback head
+ *
+ * Free up the job with embedded fence after the RCU grace period.
+ */
+static void amdgpu_job_fence_free(struct rcu_head *rcu)
+{
+	struct dma_fence *f = container_of(rcu, struct dma_fence, rcu);
+
+	/* free job if fence has a parent job */
+	kfree(container_of(f, struct amdgpu_job, hw_fence));
 }
 
 /**
@@ -727,6 +900,19 @@ static void amdgpu_fence_release(struct dma_fence *f)
 	call_rcu(&f->rcu, amdgpu_fence_free);
 }
 
+/**
+ * amdgpu_job_fence_release - callback that job embedded fence can be freed
+ *
+ * @f: fence
+ *
+ * This is the simliar function with amdgpu_fence_release above, it
+ * only handles the job embedded fence.
+ */
+static void amdgpu_job_fence_release(struct dma_fence *f)
+{
+	call_rcu(&f->rcu, amdgpu_job_fence_free);
+}
+
 static const struct dma_fence_ops amdgpu_fence_ops = {
 	.get_driver_name = amdgpu_fence_get_driver_name,
 	.get_timeline_name = amdgpu_fence_get_timeline_name,
@@ -734,6 +920,12 @@ static const struct dma_fence_ops amdgpu_fence_ops = {
 	.release = amdgpu_fence_release,
 };
 
+static const struct dma_fence_ops amdgpu_job_fence_ops = {
+	.get_driver_name = amdgpu_fence_get_driver_name,
+	.get_timeline_name = amdgpu_job_fence_get_timeline_name,
+	.enable_signaling = amdgpu_job_fence_enable_signaling,
+	.release = amdgpu_job_fence_release,
+};
 
 /*
  * Fence debugfs
@@ -792,16 +984,22 @@ static int gpu_recover_get(void *data, u64 *val)
 	struct drm_device *dev = adev_to_drm(adev);
 	int r;
 
-	r = pm_runtime_get_sync(dev->dev);
-	if (r < 0) {
-		pm_runtime_put_autosuspend(dev->dev);
-		return 0;
+	if (adev->runpm) {
+		r = pm_runtime_get_sync(dev->dev);
+		if (r < 0) {
+			pm_runtime_put_autosuspend(dev->dev);
+			return 0;
+		}
+		vangogh_lite_ifpo_power_on(adev);
 	}
 
 	*val = amdgpu_device_gpu_recover(adev, NULL);
 
-	pm_runtime_mark_last_busy(dev->dev);
-	pm_runtime_put_autosuspend(dev->dev);
+	if (adev->runpm) {
+		vangogh_lite_ifpo_count_decrease(adev);
+		pm_runtime_mark_last_busy(dev->dev);
+		pm_runtime_put_autosuspend(dev->dev);
+	}
 
 	return 0;
 }

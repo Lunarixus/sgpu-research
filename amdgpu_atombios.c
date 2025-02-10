@@ -699,9 +699,6 @@ int amdgpu_atombios_get_clock_info(struct amdgpu_device *adev)
 		ret = 0;
 	}
 
-	adev->pm.current_sclk = adev->clock.default_sclk;
-	adev->pm.current_mclk = adev->clock.default_mclk;
-
 	return ret;
 }
 

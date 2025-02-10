@@ -1,5 +1,5 @@
 #
-# Copyright 2017 Advanced Micro Devices, Inc.
+# Copyright 2022 Advanced Micro Devices, Inc.
 #
 # Permission is hereby granted, free of charge, to any person obtaining a
 # copy of this software and associated documentation files (the "Software"),
@@ -23,25 +23,27 @@
 # Makefile for the drm device driver.  This driver provides support for the
 # Direct Rendering Infrastructure (DRI) in XFree86 4.1.0 and higher.
 
-FULL_AMD_PATH=$(srctree)/$(src)/..
+FULL_AMD_PATH=$(srctree)/drivers/gpu/drm/amd
+FULL_SGPU_PATH=$(srctree)/$(src)/..
 DISPLAY_FOLDER_NAME=display
 FULL_AMD_DISPLAY_PATH = $(FULL_AMD_PATH)/$(DISPLAY_FOLDER_NAME)
 
-ccflags-y := -I$(FULL_AMD_PATH)/include/asic_reg \
-	-I$(FULL_AMD_PATH)/include \
-	-I$(FULL_AMD_PATH)/amdgpu \
-	-I$(FULL_AMD_PATH)/pm/inc \
-	-I$(FULL_AMD_PATH)/acp/include \
+ccflags-y := -I$(FULL_SGPU_PATH)/include/asic_reg \
+	-I$(FULL_SGPU_PATH)/include \
+	-I$(FULL_SGPU_PATH)/sgpu\
+	-I$(FULL_SGPU_PATH)/pm/inc \
 	-I$(FULL_AMD_DISPLAY_PATH) \
 	-I$(FULL_AMD_DISPLAY_PATH)/include \
-	-I$(FULL_AMD_DISPLAY_PATH)/dc \
-	-I$(FULL_AMD_DISPLAY_PATH)/amdgpu_dm \
 	-I$(FULL_AMD_PATH)/amdkfd
 
-amdgpu-y := amdgpu_drv.o
+ifneq ($(CONFIG_GPU_THERMAL), )
+ccflags-y += -I$(srctree)/drivers/thermal/samsung/
+endif
+
+sgpu-y := amdgpu_drv.o
 
 # add KMS driver
-amdgpu-y += amdgpu_device.o amdgpu_kms.o \
+sgpu-y += amdgpu_device.o amdgpu_kms.o \
 	amdgpu_atombios.o atombios_crtc.o amdgpu_connectors.o \
 	atom.o amdgpu_fence.o amdgpu_ttm.o amdgpu_object.o amdgpu_gart.o \
 	amdgpu_encoders.o amdgpu_display.o amdgpu_i2c.o \
@@ -60,54 +62,34 @@ amdgpu-y += amdgpu_device.o amdgpu_kms.o \
 	amdgpu_fw_attestation.o amdgpu_securedisplay.o amdgpu_hdp.o \
 	amdgpu_eeprom.o amdgpu_mca.o
 
-amdgpu-$(CONFIG_PROC_FS) += amdgpu_fdinfo.o
+sgpu-$(CONFIG_PERF_EVENTS) += amdgpu_pmu.o
+sgpu-$(CONFIG_DEBUG_FS) += sgpu_debugfs.o
 
-amdgpu-$(CONFIG_PERF_EVENTS) += amdgpu_pmu.o
-
-# add asic specific block
-amdgpu-$(CONFIG_DRM_AMDGPU_CIK)+= cik.o cik_ih.o \
-	dce_v8_0.o gfx_v7_0.o cik_sdma.o uvd_v4_2.o vce_v2_0.o
-
-amdgpu-$(CONFIG_DRM_AMDGPU_SI)+= si.o gmc_v6_0.o gfx_v6_0.o si_ih.o si_dma.o dce_v6_0.o \
+sgpu-$(CONFIG_DRM_AMDGPU_SI)+= si.o gmc_v6_0.o gfx_v6_0.o si_ih.o si_dma.o dce_v6_0.o \
 	uvd_v3_1.o
 
-amdgpu-y += \
+sgpu-y += \
 	vi.o mxgpu_vi.o nbio_v6_1.o soc15.o emu_soc.o mxgpu_ai.o nbio_v7_0.o vega10_reg_init.o \
 	vega20_reg_init.o nbio_v7_4.o nbio_v2_3.o nv.o navi10_reg_init.o navi14_reg_init.o \
-	arct_reg_init.o navi12_reg_init.o mxgpu_nv.o sienna_cichlid_reg_init.o vangogh_reg_init.o \
-	nbio_v7_2.o dimgrey_cavefish_reg_init.o hdp_v4_0.o hdp_v5_0.o aldebaran_reg_init.o aldebaran.o \
-	beige_goby_reg_init.o yellow_carp_reg_init.o cyan_skillfish_reg_init.o
-
-# add DF block
-amdgpu-y += \
-	df_v1_7.o \
-	df_v3_6.o
+	arct_reg_init.o navi12_reg_init.o mxgpu_nv.o vangogh_reg_init.o \
+	nbio_v7_2.o dimgrey_cavefish_reg_init.o hdp_v4_0.o hdp_v5_0.o \
+	vangogh_lite_reg_init.o vangogh_lite_gc.o \
+	hdp_dummy.o
 
 # add GMC block
-amdgpu-y += \
-	gmc_v7_0.o \
-	gmc_v8_0.o \
-	gfxhub_v1_0.o mmhub_v1_0.o gmc_v9_0.o gfxhub_v1_1.o mmhub_v9_4.o \
+sgpu-y += \
+	gfxhub_v1_0.o mmhub_v1_0.o gfxhub_v1_1.o mmhub_v9_4.o \
 	gfxhub_v2_0.o mmhub_v2_0.o gmc_v10_0.o gfxhub_v2_1.o mmhub_v2_3.o \
 	mmhub_v1_7.o
 
-# add UMC block
-amdgpu-y += \
-	umc_v6_0.o umc_v6_1.o umc_v6_7.o umc_v8_7.o
-
 # add IH block
-amdgpu-y += \
+sgpu-y += \
 	amdgpu_irq.o \
 	amdgpu_ih.o \
-	iceland_ih.o \
-	tonga_ih.o \
-	cz_ih.o \
-	vega10_ih.o \
-	vega20_ih.o \
-	navi10_ih.o
+	vangogh_lite_ih.o
 
 # add PSP block
-amdgpu-y += \
+sgpu-y += \
 	amdgpu_psp.o \
 	psp_v3_1.o \
 	psp_v10_0.o \
@@ -117,23 +99,22 @@ amdgpu-y += \
 	psp_v13_0.o
 
 # add DCE block
-amdgpu-y += \
+sgpu-y += \
 	dce_v10_0.o \
 	dce_v11_0.o \
 	amdgpu_vkms.o
 
 # add GFX block
-amdgpu-y += \
+sgpu-y += \
 	amdgpu_gfx.o \
 	amdgpu_rlc.o \
-	gfx_v8_0.o \
-	gfx_v9_0.o \
-	gfx_v9_4.o \
-	gfx_v9_4_2.o \
-	gfx_v10_0.o
+	gfx_v10_0.o \
+	amdgpu_cwsr.o \
+	amdgpu_tmz.o \
+	amdgpu_sws.o
 
 # add async DMA block
-amdgpu-y += \
+sgpu-y += \
 	amdgpu_sdma.o \
 	sdma_v2_4.o \
 	sdma_v3_0.o \
@@ -143,112 +124,112 @@ amdgpu-y += \
 	sdma_v5_2.o
 
 # add MES block
-amdgpu-y += \
+sgpu-y += \
 	mes_v10_1.o
 
 # add UVD block
-amdgpu-y += \
+sgpu-y += \
 	amdgpu_uvd.o \
-	uvd_v5_0.o \
-	uvd_v6_0.o \
-	uvd_v7_0.o
 
 # add VCE block
-amdgpu-y += \
+sgpu-y += \
 	amdgpu_vce.o \
-	vce_v3_0.o \
-	vce_v4_0.o
 
-# add VCN and JPEG block
-amdgpu-y += \
+sgpu-y += \
 	amdgpu_vcn.o \
-	vcn_v1_0.o \
-	vcn_v2_0.o \
-	vcn_v2_5.o \
-	vcn_v3_0.o \
-	amdgpu_jpeg.o \
-	jpeg_v1_0.o \
-	jpeg_v2_0.o \
-	jpeg_v2_5.o \
-	jpeg_v3_0.o
-
-# add ATHUB block
-amdgpu-y += \
-	athub_v1_0.o \
-	athub_v2_0.o \
-	athub_v2_1.o
-
-# add SMUIO block
-amdgpu-y += \
-	smuio_v9_0.o \
-	smuio_v11_0.o \
-	smuio_v11_0_6.o \
-	smuio_v13_0.o
 
 # add reset block
-amdgpu-y += \
+sgpu-y += \
 	amdgpu_reset.o
 
-# add MCA block
-amdgpu-y += \
-	mca_v3_0.o
-
 # add amdkfd interfaces
-amdgpu-y += amdgpu_amdkfd.o
-
+sgpu-y += amdgpu_amdkfd.o
 
 ifneq ($(CONFIG_HSA_AMD),)
 AMDKFD_PATH := ../amdkfd
 include $(FULL_AMD_PATH)/amdkfd/Makefile
-amdgpu-y += $(AMDKFD_FILES)
-amdgpu-y += \
+sgpu-y += $(AMDKFD_FILES)
+sgpu-y += \
 	amdgpu_amdkfd_fence.o \
 	amdgpu_amdkfd_gpuvm.o \
 	amdgpu_amdkfd_gfx_v8.o \
 	amdgpu_amdkfd_gfx_v9.o \
-	amdgpu_amdkfd_arcturus.o \
-	amdgpu_amdkfd_aldebaran.o \
 	amdgpu_amdkfd_gfx_v10.o \
 	amdgpu_amdkfd_gfx_v10_3.o
 
 ifneq ($(CONFIG_DRM_AMDGPU_CIK),)
-amdgpu-y += amdgpu_amdkfd_gfx_v7.o
+sgpu-y += amdgpu_amdkfd_gfx_v7.o
 endif
 
 endif
-
-# add cgs
-amdgpu-y += amdgpu_cgs.o
 
 # GPU scheduler
-amdgpu-y += amdgpu_job.o
+sgpu-y += amdgpu_job.o
 
 # ACP componet
 ifneq ($(CONFIG_DRM_AMD_ACP),)
-amdgpu-y += amdgpu_acp.o
+sgpu-y += amdgpu_acp.o
 
 AMDACPPATH := ../acp
 include $(FULL_AMD_PATH)/acp/Makefile
 
-amdgpu-y += $(AMD_ACP_FILES)
+sgpu-y += $(AMD_ACP_FILES)
 endif
 
-amdgpu-$(CONFIG_COMPAT) += amdgpu_ioc32.o
-amdgpu-$(CONFIG_VGA_SWITCHEROO) += amdgpu_atpx_handler.o
-amdgpu-$(CONFIG_ACPI) += amdgpu_acpi.o
-amdgpu-$(CONFIG_HMM_MIRROR) += amdgpu_mn.o
+sgpu-$(CONFIG_COMPAT) += amdgpu_ioc32.o
+sgpu-$(CONFIG_VGA_SWITCHEROO) += amdgpu_atpx_handler.o
+sgpu-$(CONFIG_ACPI) += amdgpu_acpi.o
+sgpu-$(CONFIG_HMM_MIRROR) += amdgpu_mn.o
 
-include $(FULL_AMD_PATH)/pm/Makefile
-
-amdgpu-y += $(AMD_POWERPLAY_FILES)
+sgpu-y += $(AMD_POWERPLAY_FILES)
 
 ifneq ($(CONFIG_DRM_AMD_DC),)
 
 RELATIVE_AMD_DISPLAY_PATH = ../$(DISPLAY_FOLDER_NAME)
 include $(FULL_AMD_DISPLAY_PATH)/Makefile
 
-amdgpu-y += $(AMD_DISPLAY_FILES)
+sgpu-y += $(AMD_DISPLAY_FILES)
 
 endif
 
-obj-$(CONFIG_DRM_AMDGPU)+= amdgpu.o
+# add pm dvfs block
+sgpu-$(CONFIG_PM_DEVFREQ) += \
+	sgpu_utilization.o sgpu_governor.o sgpu_user_interface.o sgpu_devfreq.o
+
+# add Vangogh lite hw counter
+sgpu-y += \
+	vangogh_lite_hw_counter.o
+
+# add afm driver
+# sgpu-y += sgpu_afm.o
+
+# add Exynos interface api
+sgpu-$(CONFIG_DRM_SGPU_EXYNOS) += exynos_gpu_interface.o
+
+# add GPU Profiler api
+ifeq ($(AMIGO_VER), )
+ifdef CONFIG_SOC_S5E8535
+	ccflags-y += -DAMIGO_BUILD_VER=3
+	AMIGO_VER=3
+else
+	ccflags-y += -DAMIGO_BUILD_VER=4
+	AMIGO_VER=4
+endif
+else
+	ccflags-y += -DAMIGO_BUILD_VER=$(AMIGO_VER)
+endif
+
+ifeq ($(CONFIG_EXYNOS_GPU_PROFILER), m)
+	sgpu-y += sgpu_profiler_v$(AMIGO_VER).o
+	sgpu-y += sgpu_profiler_external_v$(AMIGO_VER).o
+else
+	sgpu-y += sgpu_profiler_dummy_v$(AMIGO_VER).o
+endif
+
+# add SGPU Debug messages
+sgpu-y += sgpu_dmsg.o
+
+# add gpu_work_period tracepoint
+sgpu-y += sgpu_worktime.o
+
+obj-$(CONFIG_DRM_SGPU)+= sgpu.o

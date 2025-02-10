@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 Advanced Micro Devices, Inc.
+ * Copyright 2015-2021 Advanced Micro Devices, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -26,13 +26,18 @@
 #include "amdgpu.h"
 #include "amdgpu_sched.h"
 #include "amdgpu_ras.h"
+#include "amdgpu_cwsr.h"
+#include "amdgpu_tmz.h"
 #include <linux/nospec.h>
 
 #define to_amdgpu_ctx_entity(e)	\
 	container_of((e), struct amdgpu_ctx_entity, entity)
 
 const unsigned int amdgpu_ctx_num_entities[AMDGPU_HW_IP_NUM] = {
-	[AMDGPU_HW_IP_GFX]	=	1,
+	/* 4 is the max gfx ring nums, not all the asics have so many rings,
+	 * For example, on Navi14, there are only 2 gfx rings enabled, so
+	 * only two rings will be exposed to user space */
+	[AMDGPU_HW_IP_GFX]	=	4,
 	[AMDGPU_HW_IP_COMPUTE]	=	4,
 	[AMDGPU_HW_IP_DMA]	=	2,
 	[AMDGPU_HW_IP_UVD]	=	1,
@@ -50,7 +55,7 @@ static int amdgpu_ctx_priority_permit(struct drm_file *filp,
 		return -EINVAL;
 
 	/* NORMAL and below are accessible by everyone */
-	if (priority <= DRM_SCHED_PRIORITY_NORMAL)
+	if (priority <= DRM_SCHED_PRIORITY_HIGH)
 		return 0;
 
 	if (capable(CAP_SYS_NICE))
@@ -61,6 +66,18 @@ static int amdgpu_ctx_priority_permit(struct drm_file *filp,
 
 	return -EACCES;
 }
+
+static unsigned int amdgpu_ctx_sched_prio_to_gfx_hw_prio(enum drm_sched_priority prio)
+{
+        switch (prio) {
+        case DRM_SCHED_PRIORITY_HIGH:
+        case DRM_SCHED_PRIORITY_KERNEL:
+                return AMDGPU_GFX_RING_PRIO_HIGH;
+        default:
+                return AMDGPU_GFX_RING_PRIO_LOW;
+        }
+}
+
 
 static enum gfx_pipe_priority amdgpu_ctx_sched_prio_to_compute_prio(enum drm_sched_priority prio)
 {
@@ -79,9 +96,16 @@ static unsigned int amdgpu_ctx_prio_sched_to_hw(struct amdgpu_device *adev,
 {
 	unsigned int hw_prio;
 
-	hw_prio = (hw_ip == AMDGPU_HW_IP_COMPUTE) ?
-			amdgpu_ctx_sched_prio_to_compute_prio(prio) :
-			AMDGPU_RING_PRIO_DEFAULT;
+	if (hw_ip == AMDGPU_HW_IP_COMPUTE) {
+		hw_prio = amdgpu_ctx_sched_prio_to_compute_prio(prio);
+	}
+	else if ((amdgpu_mcbp == 1) && (hw_ip == AMDGPU_HW_IP_GFX)) {
+		hw_prio = amdgpu_ctx_sched_prio_to_gfx_hw_prio(prio);
+	}
+	else {
+		hw_prio = AMDGPU_RING_PRIO_DEFAULT;
+	}
+
 	hw_ip = array_index_nospec(hw_ip, AMDGPU_HW_IP_NUM);
 	if (adev->gpu_sched[hw_ip][hw_prio].num_scheds == 0)
 		hw_prio = AMDGPU_RING_PRIO_DEFAULT;
@@ -111,8 +135,20 @@ static int amdgpu_ctx_init_entity(struct amdgpu_ctx *ctx, u32 hw_ip,
 	hw_prio = amdgpu_ctx_prio_sched_to_hw(adev, priority, hw_ip);
 
 	hw_ip = array_index_nospec(hw_ip, AMDGPU_HW_IP_NUM);
-	scheds = adev->gpu_sched[hw_ip][hw_prio].sched;
-	num_scheds = adev->gpu_sched[hw_ip][hw_prio].num_scheds;
+
+	if (hw_ip == AMDGPU_HW_IP_COMPUTE &&
+	    ctx->ctx_priority == AMDGPU_CTX_PRIORITY_VERY_HIGH) {
+		/* Ring0 is resevred for ACE tunnel. Assign only Ring0 scheduler
+		 * to AMDGPU_CTX_PRIORITY_VERY_HIGH ctx.
+		 */
+		sched = &adev->gfx.compute_ring[0].sched;
+		scheds = &sched;
+		num_scheds = 1;
+		DRM_INFO("Assigning ACE Tunnel ring scheduler to ctx\n");
+	} else {
+		scheds = adev->gpu_sched[hw_ip][hw_prio].sched;
+		num_scheds = adev->gpu_sched[hw_ip][hw_prio].num_scheds;
+	}
 
 	/* disable load balance if the hw engine retains context among dependent jobs */
 	if (hw_ip == AMDGPU_HW_IP_VCN_ENC ||
@@ -141,6 +177,7 @@ error_free_entity:
 static int amdgpu_ctx_init(struct amdgpu_device *adev,
 			   enum drm_sched_priority priority,
 			   struct drm_file *filp,
+			   struct amdgpu_fpriv *fpriv,
 			   struct amdgpu_ctx *ctx)
 {
 	int r;
@@ -155,13 +192,15 @@ static int amdgpu_ctx_init(struct amdgpu_device *adev,
 
 	kref_init(&ctx->refcount);
 	spin_lock_init(&ctx->ring_lock);
-	mutex_init(&ctx->lock);
 
 	ctx->reset_counter = atomic_read(&adev->gpu_reset_counter);
 	ctx->reset_counter_query = ctx->reset_counter;
 	ctx->vram_lost_counter = atomic_read(&adev->vram_lost_counter);
 	ctx->init_priority = priority;
 	ctx->override_priority = DRM_SCHED_PRIORITY_UNSET;
+
+	ctx->mem_size = 0;
+	ctx->fpriv = fpriv;
 
 	return 0;
 }
@@ -175,7 +214,8 @@ static void amdgpu_ctx_fini_entity(struct amdgpu_ctx_entity *entity)
 		return;
 
 	for (i = 0; i < amdgpu_sched_jobs; ++i)
-		dma_fence_put(entity->fences[i]);
+		if (entity->fences[i])
+			dma_fence_put(entity->fences[i]);
 
 	kfree(entity);
 }
@@ -196,7 +236,15 @@ static void amdgpu_ctx_fini(struct kref *ref)
 		}
 	}
 
-	mutex_destroy(&ctx->lock);
+	if (cwsr_enable || ctx->secure_mode) {
+		amdgpu_ctx_fini_entity(ctx->priv_entities);
+		ctx->priv_entities = NULL;
+	}
+
+#ifndef CONFIG_HSA_AMD
+	amdgpu_cwsr_deinit(ctx);
+	amdgpu_tmz_deinit(ctx);
+#endif
 	kfree(ctx);
 }
 
@@ -204,6 +252,15 @@ int amdgpu_ctx_get_entity(struct amdgpu_ctx *ctx, u32 hw_ip, u32 instance,
 			  u32 ring, struct drm_sched_entity **entity)
 {
 	int r;
+	struct amdgpu_ring *rq_ring;
+
+        /* In case of MCBP for Gfx IP we ignore the RING ID passed and always
+         * operate on RING 0 so that GPU scheduler can choose the RING ID based
+         * on priority and load on each scheduler
+	 */
+        if ((amdgpu_mcbp == 1) && (hw_ip == AMDGPU_HW_IP_GFX)) {
+                ring = 0;
+        }
 
 	if (hw_ip >= AMDGPU_HW_IP_NUM) {
 		DRM_ERROR("unknown HW IP type: %d\n", hw_ip);
@@ -221,6 +278,41 @@ int amdgpu_ctx_get_entity(struct amdgpu_ctx *ctx, u32 hw_ip, u32 instance,
 		return -EINVAL;
 	}
 
+#ifndef CONFIG_HSA_AMD
+	if (amdgpu_tmz && ctx->secure_mode && !ctx->tmz &&
+	    hw_ip == AMDGPU_HW_IP_COMPUTE) {
+		r = amdgpu_tmz_init(ctx);
+		if (r)
+			return r;
+	}
+
+	if (amdgpu_tmz && ctx->secure_mode && ctx->tmz) {
+		*entity = &ctx->priv_entities->entity;
+
+		return 0;
+	}
+
+	if (cwsr_enable && hw_ip == AMDGPU_HW_IP_COMPUTE && !ctx->cwsr_init &&
+	    ctx->ctx_priority != AMDGPU_CTX_PRIORITY_VERY_HIGH &&
+	    !ctx->secure_mode) {
+		if (amdgpu_cwsr_init(ctx) < 0)
+			goto out;
+	}
+
+	if (cwsr_enable && hw_ip == AMDGPU_HW_IP_COMPUTE && ctx->cwsr &&
+	    ctx->ctx_priority != AMDGPU_CTX_PRIORITY_VERY_HIGH) {
+		*entity = &ctx->priv_entities->entity;
+
+		if ((*entity)->rq) {
+			rq_ring = to_amdgpu_ring((*entity)->rq->sched);
+			//if cwsr queue is broken, just fallback
+			if (!rq_ring->cwsr_queue_broken)
+				return 0;
+		}
+	}
+#endif
+
+out:
 	if (ctx->entities[hw_ip][ring] == NULL) {
 		r = amdgpu_ctx_init_entity(ctx, hw_ip, ring);
 		if (r)
@@ -235,7 +327,10 @@ static int amdgpu_ctx_alloc(struct amdgpu_device *adev,
 			    struct amdgpu_fpriv *fpriv,
 			    struct drm_file *filp,
 			    enum drm_sched_priority priority,
-			    uint32_t *id)
+			    int ctx_priority,
+			    uint32_t *id,
+			    bool ifh_mode,
+			    bool secure_mode)
 {
 	struct amdgpu_ctx_mgr *mgr = &fpriv->ctx_mgr;
 	struct amdgpu_ctx *ctx;
@@ -248,20 +343,66 @@ static int amdgpu_ctx_alloc(struct amdgpu_device *adev,
 	mutex_lock(&mgr->lock);
 	r = idr_alloc(&mgr->ctx_handles, ctx, 1, AMDGPU_VM_MAX_NUM_CTX, GFP_KERNEL);
 	if (r < 0) {
-		mutex_unlock(&mgr->lock);
-		kfree(ctx);
-		return r;
+		goto kfree_out;
 	}
 
+	ctx->secure_mode = secure_mode;
 	*id = (uint32_t)r;
-	r = amdgpu_ctx_init(adev, priority, filp, ctx);
+	r = amdgpu_ctx_init(adev, priority, filp, fpriv, ctx);
 	if (r) {
-		idr_remove(&mgr->ctx_handles, *id);
-		*id = 0;
-		kfree(ctx);
+		goto idr_kfree_out;
+	} else
+		ctx->ifh_mode = ifh_mode;
+
+	ctx->ctx_priority = ctx_priority;
+
+	if (cwsr_enable || secure_mode) {
+		ctx->priv_entities =
+			kzalloc(offsetof(typeof(*ctx->priv_entities),
+				fences[amdgpu_sched_jobs]),
+				GFP_KERNEL);
+
+		if (!ctx->priv_entities) {
+			r = -ENOMEM;
+			goto idr_kfree_out;
+		}
+
+		ctx->priv_entities->sequence = 1;
 	}
+
+	mutex_unlock(&mgr->lock);
+	return 0;
+
+idr_kfree_out:
+	idr_remove(&mgr->ctx_handles, *id);
+	*id = 0;
+kfree_out:
+	kfree(ctx);
 	mutex_unlock(&mgr->lock);
 	return r;
+}
+
+static void amdgpu_ctx_free_pc_sqtt_workaround(struct amdgpu_ctx *ctx)
+{
+	struct amdgpu_device *adev = ctx->adev;
+
+	mutex_lock(&adev->pc_sqtt_mutex);
+	if (ctx->pc_gfx_rings || ctx->pc_compute_rings) {
+		atomic_dec(&adev->pc_count);
+		/* if pc_count is 0, there are no ctx have perfcounter active.
+		 * Safe to disable the workaround. */
+		if (atomic_read(&adev->pc_count) == 0)
+			amdgpu_gfx_sw_workaround(adev, WA_CG_PERFCOUNTER, 0);
+	}
+
+	if (ctx->sqtt_gfx_rings || ctx->sqtt_compute_rings) {
+		atomic_dec(&adev->sqtt_count);
+		/* if sqtt_count is 0, there are no ctx have perfcounter active.
+		 * Safe to disable the workaround. */
+		if (atomic_read(&adev->sqtt_count) == 0)
+			amdgpu_gfx_sw_workaround(adev, WA_CG_SQ_THREAD_TRACE, 0);
+	}
+	mutex_unlock(&adev->pc_sqtt_mutex);
 }
 
 static void amdgpu_ctx_do_release(struct kref *ref)
@@ -278,6 +419,12 @@ static void amdgpu_ctx_do_release(struct kref *ref)
 			drm_sched_entity_destroy(&ctx->entities[i][j]->entity);
 		}
 	}
+
+	if (ctx->priv_entities && (cwsr_enable || ctx->secure_mode))
+		drm_sched_entity_destroy(&ctx->priv_entities->entity);
+
+	if (ctx->adev->asic_type == CHIP_VANGOGH_LITE)
+		amdgpu_ctx_free_pc_sqtt_workaround(ctx);
 
 	amdgpu_ctx_fini(ref);
 }
@@ -396,15 +543,24 @@ int amdgpu_ctx_ioctl(struct drm_device *dev, void *data,
 		     struct drm_file *filp)
 {
 	int r;
+	int ctx_priority;
 	uint32_t id;
+	bool ifh_mode;
 	enum drm_sched_priority priority;
 
 	union drm_amdgpu_ctx *args = data;
+	bool secure_mode = !!(args->in.flags & AMDGPU_CTX_FLAGS_SECURE);
 	struct amdgpu_device *adev = drm_to_adev(dev);
 	struct amdgpu_fpriv *fpriv = filp->driver_priv;
 
 	id = args->in.ctx_id;
-	r = amdgpu_to_sched_priority(args->in.priority, &priority);
+	if (args->in.flags & AMDGPU_CTX_FLAGS_IFH)
+		ifh_mode = true;
+	else
+		ifh_mode = false;
+
+	ctx_priority = args->in.priority;
+	r = amdgpu_to_sched_priority(ctx_priority, &priority);
 
 	/* For backwards compatibility reasons, we need to accept
 	 * ioctls with garbage in the priority field */
@@ -413,7 +569,8 @@ int amdgpu_ctx_ioctl(struct drm_device *dev, void *data,
 
 	switch (args->in.op) {
 	case AMDGPU_CTX_OP_ALLOC_CTX:
-		r = amdgpu_ctx_alloc(adev, fpriv, filp, priority, &id);
+		r = amdgpu_ctx_alloc(adev, fpriv, filp, priority,
+				     ctx_priority, &id, ifh_mode, secure_mode);
 		args->out.alloc.ctx_id = id;
 		break;
 	case AMDGPU_CTX_OP_FREE_CTX:
@@ -501,7 +658,6 @@ struct dma_fence *amdgpu_ctx_get_fence(struct amdgpu_ctx *ctx,
 		spin_unlock(&ctx->ring_lock);
 		return ERR_PTR(-EINVAL);
 	}
-
 
 	if (seq + amdgpu_sched_jobs < centity->sequence) {
 		spin_unlock(&ctx->ring_lock);
@@ -616,6 +772,69 @@ long amdgpu_ctx_mgr_entity_flush(struct amdgpu_ctx_mgr *mgr, long timeout)
 	return timeout;
 }
 
+static void amdgpu_ctx_finished_check(struct amdgpu_ctx_entity *centity,
+				      struct amdgpu_ctx *ctx)
+{
+	uint64_t seq, cseq = centity->sequence;
+	uint64_t start, end;
+
+	start = cseq - 1;
+	end = (cseq > amdgpu_sched_jobs) ? cseq - amdgpu_sched_jobs : 1;
+
+	for (seq = start; seq >= end; seq--) {
+		uint64_t idx = seq & (amdgpu_sched_jobs - 1);
+		struct drm_sched_fence *s_fence = to_drm_sched_fence(centity->fences[idx]);
+
+		DRM_DEBUG("%s: pid=%d, centity=%016llx, fence[%d]=%016llx, scheduled=%d, finished=%d",
+			   __func__, ctx->fpriv->vm.task_info.tgid,
+			   centity, idx, &s_fence->finished,
+			   dma_fence_is_signaled(&s_fence->scheduled),
+			   dma_fence_is_signaled(&s_fence->finished));
+
+		if (dma_fence_is_signaled(&s_fence->finished))
+			break;
+
+		if (dma_fence_is_signaled(&s_fence->scheduled) &&
+		    !dma_fence_is_signaled(&s_fence->finished)) {
+			if (s_fence->finished.error) {
+				DRM_DEBUG("%s: pid=%d, centity=%016llx, fence[%d]=%016llx, error=%d",
+					  __func__, ctx->fpriv->vm.task_info.tgid,
+					   centity, idx, &s_fence->finished,
+					    s_fence->finished.error);
+			} else {
+				signed long timeout = 0, retry = 0;
+
+				SGPU_LOG(ctx->adev, DMSG_INFO, DMSG_MEMORY,
+					 "pid=%d, centity=%016llx, fence[%d]=%016llx, wait_start, ret=%d",
+					 ctx->fpriv->vm.task_info.tgid,
+					 centity, idx, &s_fence->finished,
+					 dma_fence_get_status(&s_fence->finished));
+
+				while (!timeout) {
+					retry++;
+					timeout = dma_fence_wait_timeout(&s_fence->finished, false,
+									 msecs_to_jiffies(5000));
+					SGPU_LOG(ctx->adev, DMSG_INFO, DMSG_MEMORY,
+						 "pid=%d, centity=%016llx, fence[%d]=%016llx, timeout=%ld, retry=%lu",
+						 ctx->fpriv->vm.task_info.tgid,
+						 centity, idx, &s_fence->finished,
+						 timeout, retry);
+				}
+
+				DRM_DEBUG("%s: pid=%d, centity=%016llx, fence[%d]=%016llx, wait_end, ret=%d",
+					  __func__, ctx->fpriv->vm.task_info.tgid,
+					  centity, idx, &s_fence->finished,
+					  dma_fence_get_status(&s_fence->finished));
+				SGPU_LOG(ctx->adev, DMSG_INFO, DMSG_MEMORY,
+					 "pid=%d, centity=%016llx, fence[%d]=%016llx, wait_end, timeout=%ld, ret=%d",
+					 ctx->fpriv->vm.task_info.tgid, centity,
+					 idx, &s_fence->finished, timeout,
+					 dma_fence_get_status(&s_fence->finished));
+			}
+		}
+	}
+}
+
 void amdgpu_ctx_mgr_entity_fini(struct amdgpu_ctx_mgr *mgr)
 {
 	struct amdgpu_ctx *ctx;
@@ -638,9 +857,17 @@ void amdgpu_ctx_mgr_entity_fini(struct amdgpu_ctx_mgr *mgr)
 					continue;
 
 				entity = &ctx->entities[i][j]->entity;
+				if (current->flags & PF_EXITING)
+					complete_all(&entity->entity_idle);
+
 				drm_sched_entity_fini(entity);
+				amdgpu_ctx_finished_check(ctx->entities[i][j],
+							  ctx);
 			}
 		}
+
+		if (cwsr_enable || ctx->secure_mode)
+			drm_sched_entity_fini(&ctx->priv_entities->entity);
 	}
 }
 

@@ -45,7 +45,6 @@
 #include "cik_sdma.h"
 #include "uvd_v4_2.h"
 #include "vce_v2_0.h"
-#include "cik_dpm.h"
 
 #include "uvd/uvd_4_2_d.h"
 
@@ -1380,7 +1379,6 @@ static bool cik_asic_supports_baco(struct amdgpu_device *adev)
 	switch (adev->asic_type) {
 	case CHIP_BONAIRE:
 	case CHIP_HAWAII:
-		return amdgpu_dpm_is_baco_supported(adev);
 	default:
 		return false;
 	}
@@ -1428,13 +1426,8 @@ static int cik_asic_reset(struct amdgpu_device *adev)
 {
 	int r;
 
-	/* APUs don't have full asic reset */
-	if (adev->flags & AMD_IS_APU)
-		return 0;
-
 	if (cik_asic_reset_method(adev) == AMD_RESET_METHOD_BACO) {
 		dev_info(adev->dev, "BACO reset\n");
-		r = amdgpu_dpm_baco_reset(adev);
 	} else {
 		dev_info(adev->dev, "PCI CONFIG reset\n");
 		r = cik_asic_pci_config_reset(adev);
@@ -1574,8 +1567,17 @@ static void cik_pcie_gen3_enable(struct amdgpu_device *adev)
 			u16 bridge_cfg2, gpu_cfg2;
 			u32 max_lw, current_lw, tmp;
 
-			pcie_capability_set_word(root, PCI_EXP_LNKCTL, PCI_EXP_LNKCTL_HAWD);
-			pcie_capability_set_word(adev->pdev, PCI_EXP_LNKCTL, PCI_EXP_LNKCTL_HAWD);
+			pcie_capability_read_word(root, PCI_EXP_LNKCTL,
+						  &bridge_cfg);
+			pcie_capability_read_word(adev->pdev, PCI_EXP_LNKCTL,
+						  &gpu_cfg);
+
+			tmp16 = bridge_cfg | PCI_EXP_LNKCTL_HAWD;
+			pcie_capability_write_word(root, PCI_EXP_LNKCTL, tmp16);
+
+			tmp16 = gpu_cfg | PCI_EXP_LNKCTL_HAWD;
+			pcie_capability_write_word(adev->pdev, PCI_EXP_LNKCTL,
+						   tmp16);
 
 			tmp = RREG32_PCIE(ixPCIE_LC_STATUS1);
 			max_lw = (tmp & PCIE_LC_STATUS1__LC_DETECTED_LINK_WIDTH_MASK) >>
@@ -1628,14 +1630,21 @@ static void cik_pcie_gen3_enable(struct amdgpu_device *adev)
 				msleep(100);
 
 				/* linkctl */
-				pcie_capability_clear_and_set_word(root, PCI_EXP_LNKCTL,
-								   PCI_EXP_LNKCTL_HAWD,
-								   bridge_cfg &
-								   PCI_EXP_LNKCTL_HAWD);
-				pcie_capability_clear_and_set_word(adev->pdev, PCI_EXP_LNKCTL,
-								   PCI_EXP_LNKCTL_HAWD,
-								   gpu_cfg &
-								   PCI_EXP_LNKCTL_HAWD);
+				pcie_capability_read_word(root, PCI_EXP_LNKCTL,
+							  &tmp16);
+				tmp16 &= ~PCI_EXP_LNKCTL_HAWD;
+				tmp16 |= (bridge_cfg & PCI_EXP_LNKCTL_HAWD);
+				pcie_capability_write_word(root, PCI_EXP_LNKCTL,
+							   tmp16);
+
+				pcie_capability_read_word(adev->pdev,
+							  PCI_EXP_LNKCTL,
+							  &tmp16);
+				tmp16 &= ~PCI_EXP_LNKCTL_HAWD;
+				tmp16 |= (gpu_cfg & PCI_EXP_LNKCTL_HAWD);
+				pcie_capability_write_word(adev->pdev,
+							   PCI_EXP_LNKCTL,
+							   tmp16);
 
 				/* linkctl2 */
 				pcie_capability_read_word(root, PCI_EXP_LNKCTL2,
@@ -1703,7 +1712,7 @@ static void cik_program_aspm(struct amdgpu_device *adev)
 	bool disable_l0s = false, disable_l1 = false, disable_plloff_in_l1 = false;
 	bool disable_clkreq = false;
 
-	if (!amdgpu_device_should_use_aspm(adev))
+	if (amdgpu_aspm == 0)
 		return;
 
 	if (pci_is_root_bus(adev->pdev->bus))

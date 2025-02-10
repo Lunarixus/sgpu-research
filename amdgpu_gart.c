@@ -75,7 +75,7 @@ static int amdgpu_gart_dummy_page_init(struct amdgpu_device *adev)
 
 	if (adev->dummy_page_addr)
 		return 0;
-	adev->dummy_page_addr = dma_map_page(&adev->pdev->dev, dummy_page, 0,
+	adev->dummy_page_addr = dma_map_page(&adev->pldev->dev, dummy_page, 0,
 					     PAGE_SIZE, DMA_BIDIRECTIONAL);
 	if (dma_mapping_error(&adev->pdev->dev, adev->dummy_page_addr)) {
 		dev_err(&adev->pdev->dev, "Failed to DMA MAP the dummy page\n");
@@ -133,6 +133,34 @@ int amdgpu_gart_table_vram_alloc(struct amdgpu_device *adev)
 			return r;
 		}
 	}
+	return 0;
+}
+
+/**
+ * amdgpu_gart_table_sysram_alloc - allocate sysram for gart page table
+ *
+ * @adev: amdgpu_device pointer
+ *
+ * Allocate system ram memory for GART page table
+ * Returns 0 for success, error for failure.
+ */
+int amdgpu_gart_table_sysram_alloc(struct amdgpu_device *adev)
+{
+	u64 size;
+
+	size = adev->gart.table_size;
+	if (adev->csm_gart_paddr == 0) {
+		adev->csm_gart_vaddr =
+				dma_alloc_coherent(adev->dev,
+						   size,
+						   &adev->csm_gart_paddr,
+						   GFP_KERNEL);
+
+		adev->gart.ptr = adev->csm_gart_vaddr;
+		DRM_INFO("set gart memory @phy_0x%llx @virt_%p\n",
+			 adev->csm_gart_paddr, adev->csm_gart_vaddr);
+	}
+
 	return 0;
 }
 
@@ -205,6 +233,33 @@ void amdgpu_gart_table_vram_free(struct amdgpu_device *adev)
 	}
 	amdgpu_bo_unref(&adev->gart.bo);
 	adev->gart.ptr = NULL;
+}
+
+/**
+ * amdgpu_gart_table_sysram_free - free gart page table
+ *
+ * @adev: amdgpu_device pointer
+ *
+ * Free the system ram memory used for the GART page table
+ */
+void amdgpu_gart_table_sysram_free(struct amdgpu_device *adev)
+{
+	u64 size;
+
+	if (!adev->csm_buf_paddr)
+		return;
+
+	size = adev->gart.table_size;
+
+	dma_free_coherent(adev->dev, size,
+			  adev->csm_buf_vaddr,
+			  (dma_addr_t)adev->csm_buf_paddr);
+
+	adev->gart.ptr = NULL;
+	adev->csm_gart_paddr = 0;
+	adev->csm_gart_vaddr = NULL;
+	adev->csm_buf_paddr = 0;
+	adev->csm_buf_vaddr = NULL;
 }
 
 /*
@@ -291,6 +346,9 @@ int amdgpu_gart_map(struct amdgpu_device *adev, uint64_t offset,
 			page_base += AMDGPU_GPU_PAGE_SIZE;
 		}
 	}
+
+	mb();
+
 	return 0;
 }
 

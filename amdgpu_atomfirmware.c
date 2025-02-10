@@ -550,9 +550,6 @@ int amdgpu_atomfirmware_get_clock_info(struct amdgpu_device *adev)
 		adev->clock.default_mclk =
 			le32_to_cpu(firmware_info->v31.bootup_mclk_in10khz);
 
-		adev->pm.current_sclk = adev->clock.default_sclk;
-		adev->pm.current_mclk = adev->clock.default_mclk;
-
 		ret = 0;
 	}
 

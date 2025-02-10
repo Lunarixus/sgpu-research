@@ -1,5 +1,5 @@
 /*
- * Copyright 2014 Advanced Micro Devices, Inc.
+ * Copyright 2014-2021 Advanced Micro Devices, Inc.
  * Copyright 2008 Red Hat Inc.
  * Copyright 2009 Jerome Glisse.
  *
@@ -27,6 +27,8 @@
 #include "amdgpu_gfx.h"
 #include "amdgpu_rlc.h"
 #include "amdgpu_ras.h"
+#include "amdgpu_cwsr.h"
+#include "amdgpu_tmz.h"
 
 /* delay 0.1 second to enable gfx off feature */
 #define GFX_OFF_DELAY_ENABLE         msecs_to_jiffies(100)
@@ -197,6 +199,9 @@ static bool amdgpu_gfx_is_multipipe_capable(struct amdgpu_device *adev)
 bool amdgpu_gfx_is_high_priority_compute_queue(struct amdgpu_device *adev,
 					       struct amdgpu_ring *ring)
 {
+	if (cwsr_enable)
+		return false;
+
 	/* Policy: use 1st queue as high priority compute queue if we
 	 * have more than one compute queue.
 	 */
@@ -209,45 +214,95 @@ bool amdgpu_gfx_is_high_priority_compute_queue(struct amdgpu_device *adev,
 
 void amdgpu_gfx_compute_queue_acquire(struct amdgpu_device *adev)
 {
-	int i, queue, pipe;
+	int i, queue, pipe, mec;
 	bool multipipe_policy = amdgpu_gfx_is_multipipe_capable(adev);
 	int max_queues_per_mec = min(adev->gfx.mec.num_pipe_per_mec *
 				     adev->gfx.mec.num_queue_per_pipe,
 				     adev->gfx.num_compute_rings);
 
 	if (multipipe_policy) {
-		/* policy: make queues evenly cross all pipes on MEC1 only */
 		for (i = 0; i < max_queues_per_mec; i++) {
-			pipe = i % adev->gfx.mec.num_pipe_per_mec;
-			queue = (i / adev->gfx.mec.num_pipe_per_mec) %
-				adev->gfx.mec.num_queue_per_pipe;
+			queue = i % adev->gfx.mec.num_queue_per_pipe;
+			pipe = (i / adev->gfx.mec.num_queue_per_pipe)
+				% adev->gfx.mec.num_pipe_per_mec;
+			mec = (i / adev->gfx.mec.num_queue_per_pipe)
+				/ adev->gfx.mec.num_pipe_per_mec;
 
-			set_bit(pipe * adev->gfx.mec.num_queue_per_pipe + queue,
-					adev->gfx.mec.queue_bitmap);
+			/* we've run out of HW */
+			if (mec >= adev->gfx.mec.num_mec)
+				break;
+
+			/* policy: there are only 2 non-cwsr queues statically
+			 * be mapped. One is used as dispatch tunneling queue,
+			 * the other one is used as normal queue when no enough
+			 * HW resource for CWSR.
+			 */
+			if (cwsr_enable && (mec > 0 || pipe > 0 || queue >= 2))
+				continue;
+
+			/* TMZ queue is reserved */
+			if (mec == AMDGPU_TMZ_MEC &&
+			    pipe == AMDGPU_TMZ_PIPE &&
+			    queue == AMDGPU_TMZ_QUEUE)
+				continue;
+
+			/* policy: amdgpu owns the first two queues of the
+			 * first pipe of mec0: one for ACE dispatch tunnel and
+			 * second one for CWSR as mentioned above.
+			 */
+			if (mec == 0 && queue < 2)
+				set_bit(i, adev->gfx.mec.queue_bitmap);
 		}
 	} else {
+		if (cwsr_enable)
+			max_queues_per_mec = 2;
+
 		/* policy: amdgpu owns all queues in the given pipe */
-		for (i = 0; i < max_queues_per_mec; ++i)
+		for (i = 0; i < max_queues_per_mec; ++i) {
+			queue = i % adev->gfx.mec.num_queue_per_pipe;
+			pipe = (i / adev->gfx.mec.num_queue_per_pipe)
+				% adev->gfx.mec.num_pipe_per_mec;
+			mec = (i / adev->gfx.mec.num_queue_per_pipe)
+				/ adev->gfx.mec.num_pipe_per_mec;
+
+			/* TMZ queue is reserved */
+			if (mec == AMDGPU_TMZ_MEC &&
+			    pipe == AMDGPU_TMZ_PIPE &&
+			    queue == AMDGPU_TMZ_QUEUE)
+				continue;
+
 			set_bit(i, adev->gfx.mec.queue_bitmap);
+		}
 	}
+
+        /* update the number of active compute rings */
+        adev->gfx.num_compute_rings =
+                bitmap_weight(adev->gfx.mec.queue_bitmap, AMDGPU_MAX_COMPUTE_QUEUES);
+
+        /* If you hit this case and edited the policy, you probably just
+         * need to increase AMDGPU_MAX_COMPUTE_RINGS */
+        if (WARN_ON(adev->gfx.num_compute_rings > AMDGPU_MAX_COMPUTE_RINGS))
+                adev->gfx.num_compute_rings = AMDGPU_MAX_COMPUTE_RINGS;
 
 	dev_dbg(adev->dev, "mec queue bitmap weight=%d\n", bitmap_weight(adev->gfx.mec.queue_bitmap, AMDGPU_MAX_COMPUTE_QUEUES));
 }
 
 void amdgpu_gfx_graphics_queue_acquire(struct amdgpu_device *adev)
 {
-	int i, queue, me;
+	int i, queue, me, pipe;
 
 	for (i = 0; i < AMDGPU_MAX_GFX_QUEUES; ++i) {
 		queue = i % adev->gfx.me.num_queue_per_pipe;
 		me = (i / adev->gfx.me.num_queue_per_pipe)
 		      / adev->gfx.me.num_pipe_per_me;
+		pipe = (i / adev->gfx.me.num_queue_per_pipe) %
+			adev->gfx.me.num_pipe_per_me;
 
 		if (me >= adev->gfx.me.num_me)
 			break;
-		/* policy: amdgpu owns the first queue per pipe at this stage
-		 * will extend to mulitple queues per pipe later */
-		if (me == 0 && queue < 1)
+
+		/* policy: amdgpu owns the first 4 queues of me0.pipe0 */
+		if (me == 0 && pipe == 0 && queue < 4)
 			set_bit(i, adev->gfx.me.queue_bitmap);
 	}
 
@@ -266,7 +321,7 @@ static int amdgpu_gfx_kiq_acquire(struct amdgpu_device *adev,
 		    * adev->gfx.mec.num_pipe_per_mec
 		    * adev->gfx.mec.num_queue_per_pipe;
 
-	while (--queue_bit >= 0) {
+	while (queue_bit-- >= 0) {
 		if (test_bit(queue_bit, adev->gfx.mec.queue_bitmap))
 			continue;
 
@@ -367,7 +422,7 @@ int amdgpu_gfx_mqd_sw_init(struct amdgpu_device *adev,
 
 	/* create MQD for KIQ */
 	ring = &adev->gfx.kiq.ring;
-	if (!ring->mqd_obj) {
+	if (!ring->mqd_obj && adev->asic_type != CHIP_VANGOGH_LITE) {
 		/* originaly the KIQ MQD is put in GTT domain, but for SRIOV VRAM domain is a must
 		 * otherwise hypervisor trigger SAVE_VF fail after driver unloaded which mean MQD
 		 * deallocated and gart_unbind, to strict diverage we decide to use VRAM domain for
@@ -419,7 +474,6 @@ int amdgpu_gfx_mqd_sw_init(struct amdgpu_device *adev,
 				dev_warn(adev->dev, "failed to create ring mqd bo (%d)", r);
 				return r;
 			}
-
 			/* prepare MQD backup */
 			adev->gfx.mec.mqd_backup[i] = kmalloc(mqd_size, GFP_KERNEL);
 			if (!adev->gfx.mec.mqd_backup[i])
@@ -453,11 +507,56 @@ void amdgpu_gfx_mqd_sw_fini(struct amdgpu_device *adev)
 				      &ring->mqd_ptr);
 	}
 
-	ring = &adev->gfx.kiq.ring;
-	kfree(adev->gfx.mec.mqd_backup[AMDGPU_MAX_COMPUTE_RINGS]);
-	amdgpu_bo_free_kernel(&ring->mqd_obj,
-			      &ring->mqd_gpu_addr,
-			      &ring->mqd_ptr);
+	if (adev->asic_type != CHIP_VANGOGH_LITE) {
+		ring = &adev->gfx.kiq.ring;
+		kfree(adev->gfx.mec.mqd_backup[AMDGPU_MAX_COMPUTE_RINGS]);
+		amdgpu_bo_free_kernel(&ring->mqd_obj,
+				      &ring->mqd_gpu_addr,
+				      &ring->mqd_ptr);
+	}
+}
+
+static int amdgpu_gfx_disable_kcq_pio(struct amdgpu_device *adev)
+{
+	struct amdgpu_ring *ring = NULL;
+	int ring_id = 0;
+	int r = 0;
+
+	if (!adev->gfx.mec.pio_unmap_queue)
+		return -EINVAL;
+
+	for (ring_id = 0; ring_id < AMDGPU_MAX_COMPUTE_RINGS; ring_id++) {
+		ring = &adev->gfx.compute_ring[ring_id];
+		/* Make sure ring and MQD have been initialized */
+		if (!(ring->ring_obj) || !(ring->mqd_obj))
+			break;
+
+		adev->gfx.mec.pio_unmap_queue(ring,
+					      AMDGPU_CP_HQD_DEQUEUE_MODE_STD);
+	}
+
+	return r;
+}
+
+static int amdgpu_gfx_enable_kcq_pio(struct amdgpu_device *adev)
+{
+	struct amdgpu_ring *ring = NULL;
+	int ring_id = 0;
+	int r = -EINVAL;
+	if (!adev->gfx.mec.pio_map_queue)
+		return -EINVAL;
+
+	for (ring_id = 0; ring_id < AMDGPU_MAX_COMPUTE_RINGS; ring_id++) {
+		ring = &adev->gfx.compute_ring[ring_id];
+		/* Make sure ring and MQD have been initialized */
+		if (!(ring->ring_obj) || !(ring->mqd_obj))
+			break;
+		r = adev->gfx.mec.pio_map_queue(ring);
+		if (r)
+			return r;
+	}
+
+	return r;
 }
 
 int amdgpu_gfx_disable_kcq(struct amdgpu_device *adev)
@@ -466,8 +565,9 @@ int amdgpu_gfx_disable_kcq(struct amdgpu_device *adev)
 	struct amdgpu_ring *kiq_ring = &kiq->ring;
 	int i, r;
 
-	if (!kiq->pmf || !kiq->pmf->kiq_unmap_queues)
-		return -EINVAL;
+	if (!kiq->pmf || !kiq->pmf->kiq_map_queues ||
+			!kiq->pmf->kiq_set_resources)
+		return amdgpu_gfx_disable_kcq_pio(adev);
 
 	spin_lock(&adev->gfx.kiq.ring_lock);
 	if (amdgpu_ring_alloc(kiq_ring, kiq->pmf->unmap_queues_size *
@@ -505,8 +605,9 @@ int amdgpu_gfx_enable_kcq(struct amdgpu_device *adev)
 	uint64_t queue_mask = 0;
 	int r, i;
 
-	if (!kiq->pmf || !kiq->pmf->kiq_map_queues || !kiq->pmf->kiq_set_resources)
-		return -EINVAL;
+	if (!kiq->pmf || !kiq->pmf->kiq_map_queues ||
+		!kiq->pmf->kiq_set_resources)
+		return amdgpu_gfx_enable_kcq_pio(adev);
 
 	for (i = 0; i < AMDGPU_MAX_COMPUTE_QUEUES; ++i) {
 		if (!test_bit(i, adev->gfx.mec.queue_bitmap))
@@ -562,9 +663,6 @@ void amdgpu_gfx_off_ctrl(struct amdgpu_device *adev, bool enable)
 {
 	unsigned long delay = GFX_OFF_DELAY_ENABLE;
 
-	if (!(adev->pm.pp_feature & PP_GFXOFF_MASK))
-		return;
-
 	mutex_lock(&adev->gfx.gfx_off_mutex);
 
 	if (enable) {
@@ -580,30 +678,14 @@ void amdgpu_gfx_off_ctrl(struct amdgpu_device *adev, bool enable)
 		if (adev->gfx.gfx_off_req_count == 0 &&
 		    !adev->gfx.gfx_off_state) {
 			/* If going to s2idle, no need to wait */
-			if (adev->in_s0ix) {
-				if (!amdgpu_dpm_set_powergating_by_smu(adev,
-						AMD_IP_BLOCK_TYPE_GFX, true))
-					adev->gfx.gfx_off_state = true;
-			} else {
-				schedule_delayed_work(&adev->gfx.gfx_off_delay_work,
+			if (adev->in_s0ix)
+				delay = GFX_OFF_NO_DELAY;
+			schedule_delayed_work(&adev->gfx.gfx_off_delay_work,
 					      delay);
-			}
 		}
 	} else {
-		if (adev->gfx.gfx_off_req_count == 0) {
+		if (adev->gfx.gfx_off_req_count == 0)
 			cancel_delayed_work_sync(&adev->gfx.gfx_off_delay_work);
-
-			if (adev->gfx.gfx_off_state &&
-			    !amdgpu_dpm_set_powergating_by_smu(adev, AMD_IP_BLOCK_TYPE_GFX, false)) {
-				adev->gfx.gfx_off_state = false;
-
-				if (adev->gfx.funcs->init_spm_golden) {
-					dev_dbg(adev->dev,
-						"GFXOFF is disabled, re-init SPM golden settings\n");
-					amdgpu_gfx_init_spm_golden(adev);
-				}
-			}
-		}
 
 		adev->gfx.gfx_off_req_count++;
 	}
@@ -614,15 +696,7 @@ unlock:
 
 int amdgpu_get_gfx_off_status(struct amdgpu_device *adev, uint32_t *value)
 {
-
 	int r = 0;
-
-	mutex_lock(&adev->gfx.gfx_off_mutex);
-
-	r = smu_get_status_gfxoff(adev, value);
-
-	mutex_unlock(&adev->gfx.gfx_off_mutex);
-
 	return r;
 }
 
@@ -865,10 +939,4 @@ int amdgpu_gfx_get_num_kcq(struct amdgpu_device *adev)
 
 void amdgpu_gfx_state_change_set(struct amdgpu_device *adev, enum gfx_change_state state)
 {
-	mutex_lock(&adev->pm.mutex);
-	if (adev->powerplay.pp_funcs &&
-	    adev->powerplay.pp_funcs->gfx_state_change_set)
-		((adev)->powerplay.pp_funcs->gfx_state_change_set(
-			(adev)->powerplay.pp_handle, state));
-	mutex_unlock(&adev->pm.mutex);
 }

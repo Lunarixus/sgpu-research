@@ -459,15 +459,6 @@ int amdgpu_xgmi_set_pstate(struct amdgpu_device *adev, int pstate)
 
 	dev_dbg(request_adev->dev, "Set xgmi pstate %d.\n", pstate);
 
-	ret = amdgpu_dpm_set_xgmi_pstate(request_adev, pstate);
-	if (ret) {
-		dev_err(request_adev->dev,
-			"XGMI: Set pstate failure on device %llx, hive %llx, ret %d",
-			request_adev->gmc.xgmi.node_id,
-			request_adev->gmc.xgmi.hive_id, ret);
-		goto out;
-	}
-
 	if (init_low)
 		hive->pstate = hive->hi_req_count ?
 					hive->pstate : AMDGPU_XGMI_PSTATE_MIN;
@@ -723,7 +714,7 @@ int amdgpu_xgmi_remove_device(struct amdgpu_device *adev)
 		amdgpu_put_xgmi_hive(hive);
 	}
 
-	return 0;
+	return psp_xgmi_terminate(&adev->psp);
 }
 
 static int amdgpu_xgmi_ras_late_init(struct amdgpu_device *adev)

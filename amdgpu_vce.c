@@ -32,7 +32,6 @@
 #include <drm/drm_drv.h>
 
 #include "amdgpu.h"
-#include "amdgpu_pm.h"
 #include "amdgpu_vce.h"
 #include "cikd.h"
 
@@ -344,15 +343,11 @@ static void amdgpu_vce_idle_work_handler(struct work_struct *work)
 		count += amdgpu_fence_count_emitted(&adev->vce.ring[i]);
 
 	if (count == 0) {
-		if (adev->pm.dpm_enabled) {
-			amdgpu_dpm_enable_vce(adev, false);
-		} else {
-			amdgpu_asic_set_vce_clocks(adev, 0, 0);
-			amdgpu_device_ip_set_powergating_state(adev, AMD_IP_BLOCK_TYPE_VCE,
-							       AMD_PG_STATE_GATE);
-			amdgpu_device_ip_set_clockgating_state(adev, AMD_IP_BLOCK_TYPE_VCE,
-							       AMD_CG_STATE_GATE);
-		}
+		amdgpu_asic_set_vce_clocks(adev, 0, 0);
+		amdgpu_device_ip_set_powergating_state(adev, AMD_IP_BLOCK_TYPE_VCE,
+				AMD_PG_STATE_GATE);
+		amdgpu_device_ip_set_clockgating_state(adev, AMD_IP_BLOCK_TYPE_VCE,
+				AMD_CG_STATE_GATE);
 	} else {
 		schedule_delayed_work(&adev->vce.idle_work, VCE_IDLE_TIMEOUT);
 	}
@@ -376,16 +371,11 @@ void amdgpu_vce_ring_begin_use(struct amdgpu_ring *ring)
 	mutex_lock(&adev->vce.idle_mutex);
 	set_clocks = !cancel_delayed_work_sync(&adev->vce.idle_work);
 	if (set_clocks) {
-		if (adev->pm.dpm_enabled) {
-			amdgpu_dpm_enable_vce(adev, true);
-		} else {
-			amdgpu_asic_set_vce_clocks(adev, 53300, 40000);
-			amdgpu_device_ip_set_clockgating_state(adev, AMD_IP_BLOCK_TYPE_VCE,
-							       AMD_CG_STATE_UNGATE);
-			amdgpu_device_ip_set_powergating_state(adev, AMD_IP_BLOCK_TYPE_VCE,
-							       AMD_PG_STATE_UNGATE);
-
-		}
+		amdgpu_asic_set_vce_clocks(adev, 53300, 40000);
+		amdgpu_device_ip_set_clockgating_state(adev, AMD_IP_BLOCK_TYPE_VCE,
+				AMD_CG_STATE_UNGATE);
+		amdgpu_device_ip_set_powergating_state(adev, AMD_IP_BLOCK_TYPE_VCE,
+				AMD_PG_STATE_UNGATE);
 	}
 	mutex_unlock(&adev->vce.idle_mutex);
 }

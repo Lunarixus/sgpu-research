@@ -314,39 +314,7 @@ static int psp_sw_init(void *handle)
 		}
 	}
 
-	ret = amdgpu_bo_create_kernel(adev, PSP_1_MEG, PSP_1_MEG,
-				      amdgpu_sriov_vf(adev) ?
-				      AMDGPU_GEM_DOMAIN_VRAM : AMDGPU_GEM_DOMAIN_GTT,
-				      &psp->fw_pri_bo,
-				      &psp->fw_pri_mc_addr,
-				      &psp->fw_pri_buf);
-	if (ret)
-		return ret;
-
-	ret = amdgpu_bo_create_kernel(adev, PSP_FENCE_BUFFER_SIZE, PAGE_SIZE,
-				      AMDGPU_GEM_DOMAIN_VRAM,
-				      &psp->fence_buf_bo,
-				      &psp->fence_buf_mc_addr,
-				      &psp->fence_buf);
-	if (ret)
-		goto failed1;
-
-	ret = amdgpu_bo_create_kernel(adev, PSP_CMD_BUFFER_SIZE, PAGE_SIZE,
-				      AMDGPU_GEM_DOMAIN_VRAM,
-				      &psp->cmd_buf_bo, &psp->cmd_buf_mc_addr,
-				      (void **)&psp->cmd_buf_mem);
-	if (ret)
-		goto failed2;
-
 	return 0;
-
-failed2:
-	amdgpu_bo_free_kernel(&psp->fence_buf_bo,
-			      &psp->fence_buf_mc_addr, &psp->fence_buf);
-failed1:
-	amdgpu_bo_free_kernel(&psp->fw_pri_bo,
-			      &psp->fw_pri_mc_addr, &psp->fw_pri_buf);
-	return ret;
 }
 
 static int psp_sw_fini(void *handle)
@@ -375,13 +343,6 @@ static int psp_sw_fini(void *handle)
 
 	kfree(cmd);
 	cmd = NULL;
-
-	amdgpu_bo_free_kernel(&psp->fw_pri_bo,
-			      &psp->fw_pri_mc_addr, &psp->fw_pri_buf);
-	amdgpu_bo_free_kernel(&psp->fence_buf_bo,
-			      &psp->fence_buf_mc_addr, &psp->fence_buf);
-	amdgpu_bo_free_kernel(&psp->cmd_buf_bo, &psp->cmd_buf_mc_addr,
-			      (void **)&psp->cmd_buf_mem);
 
 	return 0;
 }
@@ -2246,16 +2207,12 @@ static int psp_hw_start(struct psp_context *psp)
 		return ret;
 	}
 
-	if (amdgpu_sriov_vf(adev) && amdgpu_in_reset(adev))
-		goto skip_pin_bo;
-
 	ret = psp_tmr_init(psp);
 	if (ret) {
 		DRM_ERROR("PSP tmr init failed!\n");
 		return ret;
 	}
 
-skip_pin_bo:
 	/*
 	 * For ASICs with DF Cstate management centralized
 	 * to PMFW, TMR setup should be performed after PMFW
@@ -2430,7 +2387,6 @@ static void psp_print_fw_hdr(struct psp_context *psp,
 		amdgpu_ucode_print_rlc_hdr(hdr);
 		break;
 	case AMDGPU_UCODE_ID_SMC:
-		hdr = (struct common_firmware_header *)adev->pm.fw->data;
 		amdgpu_ucode_print_smc_hdr(hdr);
 		break;
 	default:
@@ -2479,20 +2435,9 @@ static int psp_load_smu_fw(struct psp_context *psp)
 	struct amdgpu_device *adev = psp->adev;
 	struct amdgpu_firmware_info *ucode =
 			&adev->firmware.ucode[AMDGPU_UCODE_ID_SMC];
-	struct amdgpu_ras *ras = psp->ras_context.ras;
 
 	if (!ucode->fw || amdgpu_sriov_vf(psp->adev))
 		return 0;
-
-	if ((amdgpu_in_reset(adev) &&
-	     ras && adev->ras_enabled &&
-	     (adev->asic_type == CHIP_ARCTURUS ||
-	      adev->asic_type == CHIP_VEGA20))) {
-		ret = amdgpu_dpm_set_mp1_state(adev, PP_MP1_STATE_UNLOAD);
-		if (ret) {
-			DRM_WARN("Failed to set MP1 state prepare for reload\n");
-		}
-	}
 
 	ret = psp_execute_non_psp_fw_load(psp, ucode);
 
@@ -2505,7 +2450,7 @@ static int psp_load_smu_fw(struct psp_context *psp)
 static bool fw_load_skip_check(struct psp_context *psp,
 			       struct amdgpu_firmware_info *ucode)
 {
-	if (!ucode->fw || !ucode->ucode_size)
+	if (!ucode->fw)
 		return true;
 
 	if (ucode->ucode_id == AMDGPU_UCODE_ID_SMC &&
@@ -2619,18 +2564,51 @@ static int psp_load_fw(struct amdgpu_device *adev)
 	struct psp_context *psp = &adev->psp;
 
 	if (amdgpu_sriov_vf(adev) && amdgpu_in_reset(adev)) {
-		/* should not destroy ring, only stop */
-		psp_ring_stop(psp, PSP_RING_TYPE__KM);
-	} else {
-		memset(psp->fence_buf, 0, PSP_FENCE_BUFFER_SIZE);
-
-		ret = psp_ring_init(psp, PSP_RING_TYPE__KM);
-		if (ret) {
-			DRM_ERROR("PSP ring init failed!\n");
-			goto failed;
-		}
+		psp_ring_stop(psp, PSP_RING_TYPE__KM); /* should not destroy ring, only stop */
+		goto skip_memalloc;
 	}
 
+	if (amdgpu_sriov_vf(adev)) {
+		ret = amdgpu_bo_create_kernel(adev, PSP_1_MEG, PSP_1_MEG,
+						AMDGPU_GEM_DOMAIN_VRAM,
+						&psp->fw_pri_bo,
+						&psp->fw_pri_mc_addr,
+						&psp->fw_pri_buf);
+	} else {
+		ret = amdgpu_bo_create_kernel(adev, PSP_1_MEG, PSP_1_MEG,
+						AMDGPU_GEM_DOMAIN_GTT,
+						&psp->fw_pri_bo,
+						&psp->fw_pri_mc_addr,
+						&psp->fw_pri_buf);
+	}
+
+	if (ret)
+		goto failed;
+
+	ret = amdgpu_bo_create_kernel(adev, PSP_FENCE_BUFFER_SIZE, PAGE_SIZE,
+					AMDGPU_GEM_DOMAIN_VRAM,
+					&psp->fence_buf_bo,
+					&psp->fence_buf_mc_addr,
+					&psp->fence_buf);
+	if (ret)
+		goto failed;
+
+	ret = amdgpu_bo_create_kernel(adev, PSP_CMD_BUFFER_SIZE, PAGE_SIZE,
+				      AMDGPU_GEM_DOMAIN_VRAM,
+				      &psp->cmd_buf_bo, &psp->cmd_buf_mc_addr,
+				      (void **)&psp->cmd_buf_mem);
+	if (ret)
+		goto failed;
+
+	memset(psp->fence_buf, 0, PSP_FENCE_BUFFER_SIZE);
+
+	ret = psp_ring_init(psp, PSP_RING_TYPE__KM);
+	if (ret) {
+		DRM_ERROR("PSP ring init failed!\n");
+		goto failed;
+	}
+
+skip_memalloc:
 	ret = psp_hw_start(psp);
 	if (ret)
 		goto failed;
@@ -2729,15 +2707,19 @@ static int psp_hw_fini(void *handle)
 		psp_rap_terminate(psp);
 		psp_dtm_terminate(psp);
 		psp_hdcp_terminate(psp);
-
-		if (adev->gmc.xgmi.num_physical_nodes > 1)
-			psp_xgmi_terminate(psp);
 	}
 
 	psp_asd_unload(psp);
 
 	psp_tmr_terminate(psp);
 	psp_ring_destroy(psp, PSP_RING_TYPE__KM);
+
+	amdgpu_bo_free_kernel(&psp->fw_pri_bo,
+			      &psp->fw_pri_mc_addr, &psp->fw_pri_buf);
+	amdgpu_bo_free_kernel(&psp->fence_buf_bo,
+			      &psp->fence_buf_mc_addr, &psp->fence_buf);
+	amdgpu_bo_free_kernel(&psp->cmd_buf_bo, &psp->cmd_buf_mc_addr,
+			      (void **)&psp->cmd_buf_mem);
 
 	return 0;
 }

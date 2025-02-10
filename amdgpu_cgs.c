@@ -238,7 +238,7 @@ static int amdgpu_cgs_get_firmware_info(struct cgs_device *cgs_device,
 		info->fw_version = amdgpu_get_firmware_version(cgs_device, type);
 		info->feature_version = (uint16_t)le32_to_cpu(header->ucode_feature_version);
 	} else {
-		char fw_name[30] = {0};
+		char fw_name[60] = {0};
 		int err = 0;
 		uint32_t ucode_size;
 		uint32_t ucode_start_address;

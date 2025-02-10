@@ -96,26 +96,17 @@ static void hdp_v4_0_update_clock_gating(struct amdgpu_device *adev,
 	    adev->asic_type == CHIP_RAVEN) {
 		def = data = RREG32(SOC15_REG_OFFSET(HDP, 0, mmHDP_MEM_POWER_LS));
 
-		if (enable && (adev->cg_flags & AMD_CG_SUPPORT_HDP_LS))
-			data |= HDP_MEM_POWER_LS__LS_ENABLE_MASK;
-		else
-			data &= ~HDP_MEM_POWER_LS__LS_ENABLE_MASK;
+		data &= ~HDP_MEM_POWER_LS__LS_ENABLE_MASK;
 
 		if (def != data)
 			WREG32(SOC15_REG_OFFSET(HDP, 0, mmHDP_MEM_POWER_LS), data);
 	} else {
 		def = data = RREG32(SOC15_REG_OFFSET(HDP, 0, mmHDP_MEM_POWER_CTRL));
 
-		if (enable && (adev->cg_flags & AMD_CG_SUPPORT_HDP_LS))
-			data |= HDP_MEM_POWER_CTRL__IPH_MEM_POWER_CTRL_EN_MASK |
+		data &= ~(HDP_MEM_POWER_CTRL__IPH_MEM_POWER_CTRL_EN_MASK |
 				HDP_MEM_POWER_CTRL__IPH_MEM_POWER_LS_EN_MASK |
 				HDP_MEM_POWER_CTRL__RC_MEM_POWER_CTRL_EN_MASK |
-				HDP_MEM_POWER_CTRL__RC_MEM_POWER_LS_EN_MASK;
-		else
-			data &= ~(HDP_MEM_POWER_CTRL__IPH_MEM_POWER_CTRL_EN_MASK |
-				  HDP_MEM_POWER_CTRL__IPH_MEM_POWER_LS_EN_MASK |
-				  HDP_MEM_POWER_CTRL__RC_MEM_POWER_CTRL_EN_MASK |
-				  HDP_MEM_POWER_CTRL__RC_MEM_POWER_LS_EN_MASK);
+				HDP_MEM_POWER_CTRL__RC_MEM_POWER_LS_EN_MASK);
 
 		if (def != data)
 			WREG32(SOC15_REG_OFFSET(HDP, 0, mmHDP_MEM_POWER_CTRL), data);

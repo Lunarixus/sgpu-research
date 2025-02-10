@@ -35,7 +35,6 @@
 #include <drm/drm_drv.h>
 
 #include "amdgpu.h"
-#include "amdgpu_pm.h"
 #include "amdgpu_uvd.h"
 #include "cikd.h"
 #include "uvd/uvd_4_2_d.h"
@@ -1240,43 +1239,14 @@ static void amdgpu_uvd_idle_work_handler(struct work_struct *work)
 			fences += amdgpu_fence_count_emitted(&adev->uvd.inst[i].ring_enc[j]);
 		}
 	}
-
-	if (fences == 0) {
-		if (adev->pm.dpm_enabled) {
-			amdgpu_dpm_enable_uvd(adev, false);
-		} else {
-			amdgpu_asic_set_uvd_clocks(adev, 0, 0);
-			/* shutdown the UVD block */
-			amdgpu_device_ip_set_powergating_state(adev, AMD_IP_BLOCK_TYPE_UVD,
-							       AMD_PG_STATE_GATE);
-			amdgpu_device_ip_set_clockgating_state(adev, AMD_IP_BLOCK_TYPE_UVD,
-							       AMD_CG_STATE_GATE);
-		}
-	} else {
-		schedule_delayed_work(&adev->uvd.idle_work, UVD_IDLE_TIMEOUT);
-	}
 }
 
 void amdgpu_uvd_ring_begin_use(struct amdgpu_ring *ring)
 {
 	struct amdgpu_device *adev = ring->adev;
-	bool set_clocks;
 
 	if (amdgpu_sriov_vf(adev))
 		return;
-
-	set_clocks = !cancel_delayed_work_sync(&adev->uvd.idle_work);
-	if (set_clocks) {
-		if (adev->pm.dpm_enabled) {
-			amdgpu_dpm_enable_uvd(adev, true);
-		} else {
-			amdgpu_asic_set_uvd_clocks(adev, 53300, 40000);
-			amdgpu_device_ip_set_clockgating_state(adev, AMD_IP_BLOCK_TYPE_UVD,
-							       AMD_CG_STATE_UNGATE);
-			amdgpu_device_ip_set_powergating_state(adev, AMD_IP_BLOCK_TYPE_UVD,
-							       AMD_PG_STATE_UNGATE);
-		}
-	}
 }
 
 void amdgpu_uvd_ring_end_use(struct amdgpu_ring *ring)

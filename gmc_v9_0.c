@@ -1,5 +1,5 @@
 /*
- * Copyright 2016 Advanced Micro Devices, Inc.
+ * Copyright 2016, 2020 Advanced Micro Devices, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -71,9 +71,6 @@
 #define HUBP0_DCSURF_PRI_VIEWPORT_DIMENSION__PRI_VIEWPORT_HEIGHT_MASK                                         0x3FFF0000L
 #define mmDCHUBBUB_SDPIF_MMIO_CNTRL_0                                                                  0x049d
 #define mmDCHUBBUB_SDPIF_MMIO_CNTRL_0_BASE_IDX                                                         2
-
-#define mmHUBP0_DCSURF_PRI_VIEWPORT_DIMENSION_DCN2                                                          0x05ea
-#define mmHUBP0_DCSURF_PRI_VIEWPORT_DIMENSION_DCN2_BASE_IDX                                                 2
 
 
 static const char *gfxhub_client_ids[] = {
@@ -863,7 +860,6 @@ static int gmc_v9_0_flush_gpu_tlb_pasid(struct amdgpu_device *adev,
 	uint32_t seq;
 	uint16_t queried_pasid;
 	bool ret;
-	u32 usec_timeout = amdgpu_sriov_vf(adev) ? SRIOV_USEC_TIMEOUT : adev->usec_timeout;
 	struct amdgpu_ring *ring = &adev->gfx.kiq.ring;
 	struct amdgpu_kiq *kiq = &adev->gfx.kiq;
 
@@ -903,7 +899,7 @@ static int gmc_v9_0_flush_gpu_tlb_pasid(struct amdgpu_device *adev,
 
 		amdgpu_ring_commit(ring);
 		spin_unlock(&adev->gfx.kiq.ring_lock);
-		r = amdgpu_fence_wait_polling(ring, seq, usec_timeout);
+		r = amdgpu_fence_wait_polling(ring, seq, adev->usec_timeout);
 		if (r < 1) {
 			dev_err(adev->dev, "wait for kiq fence error: %ld.\n", r);
 			up_read(&adev->reset_sem);
@@ -1107,8 +1103,6 @@ static unsigned gmc_v9_0_get_vbios_fb_size(struct amdgpu_device *adev)
 	u32 d1vga_control = RREG32_SOC15(DCE, 0, mmD1VGA_CONTROL);
 	unsigned size;
 
-	/* TODO move to DC so GMC doesn't need to hard-code DCN registers */
-
 	if (REG_GET_FIELD(d1vga_control, D1VGA_CONTROL, D1VGA_MODE_ENABLE)) {
 		size = AMDGPU_VBIOS_VGA_ALLOCATION;
 	} else {
@@ -1116,15 +1110,8 @@ static unsigned gmc_v9_0_get_vbios_fb_size(struct amdgpu_device *adev)
 
 		switch (adev->asic_type) {
 		case CHIP_RAVEN:
-			viewport = RREG32_SOC15(DCE, 0, mmHUBP0_DCSURF_PRI_VIEWPORT_DIMENSION);
-			size = (REG_GET_FIELD(viewport,
-					      HUBP0_DCSURF_PRI_VIEWPORT_DIMENSION, PRI_VIEWPORT_HEIGHT) *
-				REG_GET_FIELD(viewport,
-					      HUBP0_DCSURF_PRI_VIEWPORT_DIMENSION, PRI_VIEWPORT_WIDTH) *
-				4);
-			break;
 		case CHIP_RENOIR:
-			viewport = RREG32_SOC15(DCE, 0, mmHUBP0_DCSURF_PRI_VIEWPORT_DIMENSION_DCN2);
+			viewport = RREG32_SOC15(DCE, 0, mmHUBP0_DCSURF_PRI_VIEWPORT_DIMENSION);
 			size = (REG_GET_FIELD(viewport,
 					      HUBP0_DCSURF_PRI_VIEWPORT_DIMENSION, PRI_VIEWPORT_HEIGHT) *
 				REG_GET_FIELD(viewport,
@@ -1146,6 +1133,158 @@ static unsigned gmc_v9_0_get_vbios_fb_size(struct amdgpu_device *adev)
 	return size;
 }
 
+#if defined(CONFIG_DRM_AMDGPU_GMC_DUMP)
+static u64 gmc_v9_0_get_fault_addr(struct amdgpu_device *adev,
+				   const struct amdgpu_vmhub *hub)
+{
+	u64 addr;
+
+	addr = ((u64)
+		(RREG32(hub->vm_l2_pro_fault_addr_hi32) &
+		 VM_L2_PROTECTION_FAULT_ADDR_HI32__LOGICAL_PAGE_ADDR_HI4_MASK))
+		 << 32;
+	addr |= RREG32(hub->vm_l2_pro_fault_addr_lo32);
+	addr <<= PAGE_SHIFT;
+
+	return addr;
+}
+
+static size_t gmc_v9_0_get_walker_error(u32 fault_status, char *buf, size_t len)
+{
+	u32 temp32;
+
+	const char * const walker_error[] = {
+		"",
+		"Range",
+		"PDE0",
+		"PDE1",
+		"PDE2",
+		"Translate Further",
+		"NACK",
+		"Dummy Page",
+	};
+
+	temp32 = (fault_status &
+		  VM_L2_PROTECTION_FAULT_STATUS__WALKER_ERROR_MASK) >>
+		  VM_L2_PROTECTION_FAULT_STATUS__WALKER_ERROR__SHIFT;
+	return snprintf(buf, len,
+			"    Walker error = %s\n", walker_error[temp32]);
+}
+
+static size_t gmc_v9_0_get_permission_faults(u32 fault_status,
+					     char *buf, size_t len)
+{
+	u32 temp32, j;
+	char dump_string[64] = "";
+	const char * const permission_faults[] = {
+		"Valid",
+		"Read",
+		"Write",
+		"Execute"
+	};
+	const unsigned int num_permission_faults =
+		sizeof(permission_faults) / sizeof(const char *);
+
+	temp32 = (fault_status &
+		  VM_L2_PROTECTION_FAULT_STATUS__PERMISSION_FAULTS_MASK) >>
+		  VM_L2_PROTECTION_FAULT_STATUS__PERMISSION_FAULTS__SHIFT;
+	for (j = 0; j < num_permission_faults; j++) {
+		if (temp32 & (1 << j))
+			snprintf(dump_string,
+				 sizeof(dump_string), "%s %s,",
+				 dump_string,
+				 permission_faults[j]);
+	}
+	return snprintf(buf, len, "    Permission faults =%s\n", dump_string);
+}
+
+static size_t gmc_v9_0_get_gmc_status(struct amdgpu_device *adev,
+				      char *buf, size_t len)
+{
+	unsigned int i;
+	const struct amdgpu_vmhub *hub;
+	u32 fault_status, fault_info;
+	u64 fault_addr;
+	bool is_fault;
+	const struct amd_ip_funcs *ip_funcs;
+	bool is_gfxoff_on = false;
+	size_t size = 0;
+
+	for (i = 0; i < adev->num_ip_blocks; i++) {
+		if (adev->ip_blocks[i].version->type != AMD_IP_BLOCK_TYPE_GFX)
+			continue;
+		ip_funcs = adev->ip_blocks[i].version->funcs;
+		if (ip_funcs->is_power_on) {
+			is_gfxoff_on = ip_funcs->is_power_on((void *)adev);
+			break;
+		}
+	}
+
+	for (i = 0; i < AMDGPU_MAX_VMHUBS; i++) {
+		if (i == AMDGPU_GFXHUB_0 && !is_gfxoff_on) {
+			is_fault = false;
+		} else {
+			hub = &adev->vmhub[i];
+			fault_status = RREG32(hub->vm_l2_pro_fault_status);
+			fault_addr = gmc_v9_0_get_fault_addr(adev, hub);
+
+			is_fault = (fault_status || fault_addr);
+		}
+
+		if (i == AMDGPU_GFXHUB_0)
+			size += snprintf(buf + size, len - size,
+					 "VM Protection Fault (GFX HUB): %s\n",
+					 (is_fault ? "YES" : "NO"));
+		else
+			size += snprintf(buf + size, len - size,
+					 "VM Protection Fault (%s): %s\n",
+					 ((i == AMDGPU_MMHUB_0) ? "MM HUB 0" :
+					  "MM HUB 1"),
+					 (is_fault ? "YES" : "NO"));
+
+		if (is_fault) {
+			size += snprintf(buf + size, len - size,
+					 "  Protection Fault Status = 0x%08x\n",
+					 fault_status);
+			fault_info = (fault_status &
+				VM_L2_PROTECTION_FAULT_STATUS__VMID_MASK) >>
+				VM_L2_PROTECTION_FAULT_STATUS__VMID__SHIFT;
+			size += snprintf(buf + size, len - size,
+					 "    VMID = %d\n", fault_info);
+
+			size += gmc_v9_0_get_walker_error(fault_status,
+							   buf + size,
+							   len - size);
+			size += gmc_v9_0_get_permission_faults(fault_status,
+							       buf + size,
+							       len - size);
+
+			fault_info = (fault_status &
+				VM_L2_PROTECTION_FAULT_STATUS__CID_MASK) >>
+				VM_L2_PROTECTION_FAULT_STATUS__CID__SHIFT;
+			size += snprintf(buf + size, len - size,
+					 "    Memory client id = %d\n",
+					 fault_info);
+
+			fault_info = (fault_status &
+				VM_L2_PROTECTION_FAULT_STATUS__RW_MASK) >>
+				VM_L2_PROTECTION_FAULT_STATUS__RW__SHIFT;
+			size += snprintf(buf + size, len - size,
+					 "    Memory client R/W = %s\n",
+					 (fault_info ? "WRITE" : "READ"));
+
+			size += snprintf(buf + size, len - size,
+					 "  Protection Fault GPU Address = 0x%016llx\n",
+					 fault_addr);
+			size += snprintf(buf + size, len - size,
+					 "TODO: Dump VMPT entries of fault address\n");
+		}
+	}
+
+	return size;
+}
+#endif /* CONFIG_DRM_AMDGPU_GMC_DUMP */
+
 static const struct amdgpu_gmc_funcs gmc_v9_0_gmc_funcs = {
 	.flush_gpu_tlb = gmc_v9_0_flush_gpu_tlb,
 	.flush_gpu_tlb_pasid = gmc_v9_0_flush_gpu_tlb_pasid,
@@ -1154,7 +1293,9 @@ static const struct amdgpu_gmc_funcs gmc_v9_0_gmc_funcs = {
 	.map_mtype = gmc_v9_0_map_mtype,
 	.get_vm_pde = gmc_v9_0_get_vm_pde,
 	.get_vm_pte = gmc_v9_0_get_vm_pte,
-	.get_vbios_fb_size = gmc_v9_0_get_vbios_fb_size,
+#if defined(CONFIG_DRM_AMDGPU_GMC_DUMP)
+	.get_gmc_status = gmc_v9_0_get_gmc_status,
+#endif
 };
 
 static void gmc_v9_0_set_gmc_funcs(struct amdgpu_device *adev)
@@ -1388,7 +1529,7 @@ static int gmc_v9_0_mc_init(struct amdgpu_device *adev)
 	 */
 
 	/* check whether both host-gpu and gpu-gpu xgmi links exist */
-	if (((adev->flags & AMD_IS_APU) && !amdgpu_passthrough(adev)) ||
+	if ((adev->flags & AMD_IS_APU) ||
 	    (adev->gmc.xgmi.supported &&
 	     adev->gmc.xgmi.connected_to_cpu)) {
 		adev->gmc.aper_base =
@@ -1423,8 +1564,6 @@ static int gmc_v9_0_mc_init(struct amdgpu_device *adev)
 	} else {
 		adev->gmc.gart_size = (u64)amdgpu_gart_size << 20;
 	}
-
-	adev->gmc.gart_size += adev->pm.smu_prv_buffer_size;
 
 	gmc_v9_0_vram_gtt_location(adev, &adev->gmc);
 
@@ -1653,7 +1792,7 @@ static int gmc_v9_0_sw_fini(void *handle)
 	amdgpu_gem_force_release(adev);
 	amdgpu_vm_manager_fini(adev);
 	amdgpu_gart_table_vram_free(adev);
-	amdgpu_bo_free_kernel(&adev->gmc.pdb0_bo, NULL, &adev->gmc.ptr_pdb0);
+	amdgpu_bo_unref(&adev->gmc.pdb0_bo);
 	amdgpu_bo_fini(adev);
 
 	return 0;
@@ -1721,14 +1860,10 @@ static int gmc_v9_0_gart_enable(struct amdgpu_device *adev)
 		return -EINVAL;
 	}
 
-	if (amdgpu_sriov_vf(adev) && amdgpu_in_reset(adev))
-		goto skip_pin_bo;
-
 	r = amdgpu_gart_table_vram_pin(adev);
 	if (r)
 		return r;
 
-skip_pin_bo:
 	r = adev->gfxhub.funcs->gart_enable(adev);
 	if (r)
 		return r;
@@ -1819,6 +1954,7 @@ static int gmc_v9_0_hw_fini(void *handle)
 		return 0;
 	}
 
+	amdgpu_irq_put(adev, &adev->gmc.ecc_irq, 0);
 	amdgpu_irq_put(adev, &adev->gmc.vm_fault, 0);
 
 	return 0;

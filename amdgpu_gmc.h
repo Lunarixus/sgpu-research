@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 Advanced Micro Devices, Inc.
+ * Copyright 2018, 2020 Advanced Micro Devices, Inc.
  * All Rights Reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -101,6 +101,8 @@ struct amdgpu_vmhub {
 
 	uint32_t	vm_cntx_cntl_vm_fault;
 
+	u32		vm_l2_pro_fault_addr_lo32;
+	u32		vm_l2_pro_fault_addr_hi32;
 	const struct amdgpu_vmhub_funcs *vmhub_funcs;
 };
 
@@ -133,6 +135,11 @@ struct amdgpu_gmc_funcs {
 			   uint64_t *flags);
 	/* get the amount of memory used by the vbios for pre-OS console */
 	unsigned int (*get_vbios_fb_size)(struct amdgpu_device *adev);
+	/* get GART/VM status */
+	size_t (*get_gmc_status)(struct amdgpu_device *adev,
+		                        char *buf, size_t len);
+	void (*cwsr_flush_gpu_tlb)(u32 vmid, struct amdgpu_bo *root_bo,
+				   struct amdgpu_ring *ring);
 };
 
 struct amdgpu_xgmi_ras_funcs {
@@ -272,6 +279,8 @@ struct amdgpu_gmc {
 #define amdgpu_gmc_get_vm_pde(adev, level, dst, flags) (adev)->gmc.gmc_funcs->get_vm_pde((adev), (level), (dst), (flags))
 #define amdgpu_gmc_get_vm_pte(adev, mapping, flags) (adev)->gmc.gmc_funcs->get_vm_pte((adev), (mapping), (flags))
 #define amdgpu_gmc_get_vbios_fb_size(adev) (adev)->gmc.gmc_funcs->get_vbios_fb_size((adev))
+#define amdgpu_gmc_cwsr_flush_gpu_tlb(vmid, bo, ring) \
+		(adev)->gmc.gmc_funcs->cwsr_flush_gpu_tlb((vmid), (bo), (ring))
 
 /**
  * amdgpu_gmc_vram_full_visible - Check if full VRAM is visible through the BAR

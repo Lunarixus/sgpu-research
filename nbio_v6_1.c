@@ -167,23 +167,6 @@ static void nbio_v6_1_update_medium_grain_clock_gating(struct amdgpu_device *ade
 	uint32_t def, data;
 
 	def = data = RREG32_PCIE(smnCPM_CONTROL);
-	if (enable && (adev->cg_flags & AMD_CG_SUPPORT_BIF_MGCG)) {
-		data |= (CPM_CONTROL__LCLK_DYN_GATE_ENABLE_MASK |
-			 CPM_CONTROL__TXCLK_DYN_GATE_ENABLE_MASK |
-			 CPM_CONTROL__TXCLK_PERM_GATE_ENABLE_MASK |
-			 CPM_CONTROL__TXCLK_LCNT_GATE_ENABLE_MASK |
-			 CPM_CONTROL__TXCLK_REGS_GATE_ENABLE_MASK |
-			 CPM_CONTROL__TXCLK_PRBS_GATE_ENABLE_MASK |
-			 CPM_CONTROL__REFCLK_REGS_GATE_ENABLE_MASK);
-	} else {
-		data &= ~(CPM_CONTROL__LCLK_DYN_GATE_ENABLE_MASK |
-			  CPM_CONTROL__TXCLK_DYN_GATE_ENABLE_MASK |
-			  CPM_CONTROL__TXCLK_PERM_GATE_ENABLE_MASK |
-			  CPM_CONTROL__TXCLK_LCNT_GATE_ENABLE_MASK |
-			  CPM_CONTROL__TXCLK_REGS_GATE_ENABLE_MASK |
-			  CPM_CONTROL__TXCLK_PRBS_GATE_ENABLE_MASK |
-			  CPM_CONTROL__REFCLK_REGS_GATE_ENABLE_MASK);
-	}
 
 	if (def != data)
 		WREG32_PCIE(smnCPM_CONTROL, data);
@@ -195,15 +178,6 @@ static void nbio_v6_1_update_medium_grain_light_sleep(struct amdgpu_device *adev
 	uint32_t def, data;
 
 	def = data = RREG32_PCIE(smnPCIE_CNTL2);
-	if (enable && (adev->cg_flags & AMD_CG_SUPPORT_BIF_LS)) {
-		data |= (PCIE_CNTL2__SLV_MEM_LS_EN_MASK |
-			 PCIE_CNTL2__MST_MEM_LS_EN_MASK |
-			 PCIE_CNTL2__REPLAY_MEM_LS_EN_MASK);
-	} else {
-		data &= ~(PCIE_CNTL2__SLV_MEM_LS_EN_MASK |
-			  PCIE_CNTL2__MST_MEM_LS_EN_MASK |
-			  PCIE_CNTL2__REPLAY_MEM_LS_EN_MASK);
-	}
 
 	if (def != data)
 		WREG32_PCIE(smnPCIE_CNTL2, data);
@@ -278,7 +252,6 @@ static void nbio_v6_1_init_registers(struct amdgpu_device *adev)
 		WREG32_PCIE(smnPCIE_CI_CNTL, data);
 }
 
-#ifdef CONFIG_PCIEASPM
 static void nbio_v6_1_program_ltr(struct amdgpu_device *adev)
 {
 	uint32_t def, data;
@@ -300,11 +273,9 @@ static void nbio_v6_1_program_ltr(struct amdgpu_device *adev)
 	if (def != data)
 		WREG32_PCIE(smnBIF_CFG_DEV0_EPF0_DEVICE_CNTL2, data);
 }
-#endif
 
 static void nbio_v6_1_program_aspm(struct amdgpu_device *adev)
 {
-#ifdef CONFIG_PCIEASPM
 	uint32_t def, data;
 
 	def = data = RREG32_PCIE(smnPCIE_LC_CNTL);
@@ -360,10 +331,7 @@ static void nbio_v6_1_program_aspm(struct amdgpu_device *adev)
 	if (def != data)
 		WREG32_PCIE(smnPCIE_LC_CNTL6, data);
 
-	/* Don't bother about LTR if LTR is not enabled
-	 * in the path */
-	if (adev->pdev->ltr_path)
-		nbio_v6_1_program_ltr(adev);
+	nbio_v6_1_program_ltr(adev);
 
 	def = data = RREG32_PCIE(smnRCC_BIF_STRAP3);
 	data |= 0x5DE0 << RCC_BIF_STRAP3__STRAP_VLINK_ASPM_IDLE_TIMER__SHIFT;
@@ -387,7 +355,6 @@ static void nbio_v6_1_program_aspm(struct amdgpu_device *adev)
 	data &= ~PCIE_LC_CNTL3__LC_DSC_DONT_ENTER_L23_AFTER_PME_ACK_MASK;
 	if (def != data)
 		WREG32_PCIE(smnPCIE_LC_CNTL3, data);
-#endif
 }
 
 const struct amdgpu_nbio_funcs nbio_v6_1_funcs = {

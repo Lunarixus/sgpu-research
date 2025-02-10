@@ -736,6 +736,7 @@ int amdgpu_vm_validate_pt_bos(struct amdgpu_device *adev, struct amdgpu_vm *vm,
 		struct amdgpu_bo *bo = bo_base->bo;
 		struct amdgpu_bo *shadow = amdgpu_bo_shadowed(bo);
 
+		vm->va_updated = true;
 		r = validate(param, bo);
 		if (r)
 			return r;
@@ -768,17 +769,11 @@ int amdgpu_vm_validate_pt_bos(struct amdgpu_device *adev, struct amdgpu_vm *vm,
  * Check if all VM PDs/PTs are ready for updates
  *
  * Returns:
- * True if VM is not evicting.
+ * True if eviction list is empty.
  */
 bool amdgpu_vm_ready(struct amdgpu_vm *vm)
 {
-	bool ret;
-
-	amdgpu_vm_eviction_lock(vm);
-	ret = !vm->evicting;
-	amdgpu_vm_eviction_unlock(vm);
-
-	return ret && list_empty(&vm->evicted);
+	return list_empty(&vm->evicted);
 }
 
 /**
@@ -983,6 +978,7 @@ static int amdgpu_vm_pt_create(struct amdgpu_device *adev,
 		return r;
 	}
 
+	(*vmbo)->shadow->parent = amdgpu_bo_ref(bo);
 	amdgpu_bo_add_to_shadow_list(*vmbo);
 
 	return 0;
@@ -1127,28 +1123,15 @@ void amdgpu_vm_check_compute_bug(struct amdgpu_device *adev)
 bool amdgpu_vm_need_pipeline_sync(struct amdgpu_ring *ring,
 				  struct amdgpu_job *job)
 {
-	struct amdgpu_device *adev = ring->adev;
-	unsigned vmhub = ring->funcs->vmhub;
-	struct amdgpu_vmid_mgr *id_mgr = &adev->vm_manager.id_mgr[vmhub];
-	struct amdgpu_vmid *id;
-	bool gds_switch_needed;
 	bool vm_flush_needed = job->vm_needs_flush || ring->has_compute_vm_bug;
+
+	if (ring->cwsr)
+		return true;
 
 	if (job->vmid == 0)
 		return false;
-	id = &id_mgr->ids[job->vmid];
-	gds_switch_needed = ring->funcs->emit_gds_switch && (
-		id->gds_base != job->gds_base ||
-		id->gds_size != job->gds_size ||
-		id->gws_base != job->gws_base ||
-		id->gws_size != job->gws_size ||
-		id->oa_base != job->oa_base ||
-		id->oa_size != job->oa_size);
 
-	if (amdgpu_vmid_had_gpu_reset(adev, id))
-		return true;
-
-	return vm_flush_needed || gds_switch_needed;
+	return vm_flush_needed;
 }
 
 /**
@@ -1169,20 +1152,57 @@ int amdgpu_vm_flush(struct amdgpu_ring *ring, struct amdgpu_job *job,
 	struct amdgpu_device *adev = ring->adev;
 	unsigned vmhub = ring->funcs->vmhub;
 	struct amdgpu_vmid_mgr *id_mgr = &adev->vm_manager.id_mgr[vmhub];
-	struct amdgpu_vmid *id = &id_mgr->ids[job->vmid];
-	bool gds_switch_needed = ring->funcs->emit_gds_switch && (
+	struct amdgpu_vmid *id;
+	struct amdgpu_vm *vm = job->vm;
+	bool gds_switch_needed;
+	bool vm_flush_needed = job->vm_needs_flush;
+	struct dma_fence *fence = NULL;
+	bool pasid_mapping_needed = false;
+	unsigned patch_offset = 0;
+	bool update_spm_vmid_needed = (job->vm && (job->vm->reserved_vmid[vmhub] != NULL));
+	uint64_t fence_ctx;
+	bool need_ctx_switch;
+	int r;
+
+	fence_ctx = job->base.s_fence ? job->base.s_fence->scheduled.context : 0;
+	need_ctx_switch = ring->current_ctx != fence_ctx;
+
+	if (adev->forced_vm_flush == false && job->vmid &&
+	    adev->last_vmid == job->vmid && vm->va_updated == false &&
+	    need_ctx_switch == false &&
+	    ring->funcs->type != AMDGPU_RING_TYPE_COMPUTE) {
+		uint64_t t_pgd = 0;
+
+		if (adev->gfx.rlc.funcs->get_pgd_addr)
+			t_pgd = adev->gfx.rlc.funcs->get_pgd_addr(adev, job->vmid);
+
+		if (t_pgd == job->vm_pd_addr) {
+			SGPU_LOG(adev, DMSG_INFO, DMSG_MEMORY, "vm_flush_needed=false");
+			vm_flush_needed = false;
+		} else {
+			SGPU_LOG(adev, DMSG_INFO, DMSG_MEMORY,
+				 "vm_flush check fail pgd mismatch");
+		}
+	}
+
+	if (ring->cwsr)
+		vm_flush_needed = true;
+
+	if (vm && vm->reserved_vmid[vmhub] &&
+	    (vm->reserved_vmid[vmhub] - id_mgr->cwsr_ids) >= 0 &&
+	    (vm->reserved_vmid[vmhub] - id_mgr->cwsr_ids) <
+	    AMDGPU_MAX_CWSR_RINGS)
+		id = vm->reserved_vmid[vmhub];
+	else
+		id = &id_mgr->ids[job->vmid];
+
+	gds_switch_needed = ring->funcs->emit_gds_switch && (
 		id->gds_base != job->gds_base ||
 		id->gds_size != job->gds_size ||
 		id->gws_base != job->gws_base ||
 		id->gws_size != job->gws_size ||
 		id->oa_base != job->oa_base ||
 		id->oa_size != job->oa_size);
-	bool vm_flush_needed = job->vm_needs_flush;
-	struct dma_fence *fence = NULL;
-	bool pasid_mapping_needed = false;
-	unsigned patch_offset = 0;
-	bool update_spm_vmid_needed = (job->vm && (job->vm->reserved_vmid[vmhub] != NULL));
-	int r;
 
 	if (update_spm_vmid_needed && adev->gfx.rlc.funcs->update_spm_vmid)
 		adev->gfx.rlc.funcs->update_spm_vmid(adev, job->vmid);
@@ -1234,6 +1254,10 @@ int amdgpu_vm_flush(struct amdgpu_ring *ring, struct amdgpu_job *job,
 		id->last_flush = dma_fence_get(fence);
 		id->current_gpu_reset_count =
 			atomic_read(&adev->gpu_reset_counter);
+
+		adev->last_vmid = job->vmid;
+		vm->va_updated = false;
+
 		mutex_unlock(&id_mgr->lock);
 	}
 
@@ -1262,10 +1286,12 @@ int amdgpu_vm_flush(struct amdgpu_ring *ring, struct amdgpu_job *job,
 	if (ring->funcs->patch_cond_exec)
 		amdgpu_ring_patch_cond_exec(ring, patch_offset);
 
-	/* the double SWITCH_BUFFER here *cannot* be skipped by COND_EXEC */
-	if (ring->funcs->emit_switch_buffer) {
-		amdgpu_ring_emit_switch_buffer(ring);
-		amdgpu_ring_emit_switch_buffer(ring);
+	if (adev->asic_type != CHIP_VANGOGH_LITE) {
+		/* the double SWITCH_BUFFER here *cannot* be skipped by COND_EXEC */
+		if (ring->funcs->emit_switch_buffer) {
+			amdgpu_ring_emit_switch_buffer(ring);
+			amdgpu_ring_emit_switch_buffer(ring);
+		}
 	}
 	return 0;
 }
@@ -1908,6 +1934,8 @@ int amdgpu_vm_bo_update(struct amdgpu_device *adev, struct amdgpu_bo_va *bo_va,
 
 		if (amdgpu_bo_encrypted(bo))
 			flags |= AMDGPU_PTE_TMZ;
+		if (bo->flags & AMDGPU_GEM_CREATE_UNCACHED)
+			flags &= ~AMDGPU_PTE_SNOOPED;
 
 		bo_adev = amdgpu_ttm_adev(bo->tbo.bdev);
 	} else {
@@ -2147,6 +2175,8 @@ int amdgpu_vm_clear_freed(struct amdgpu_device *adev,
 	int r;
 
 	while (!list_empty(&vm->freed)) {
+		vm->va_updated = true;
+
 		mapping = list_first_entry(&vm->freed,
 			struct amdgpu_bo_va_mapping, list);
 		list_del(&mapping->list);
@@ -2200,6 +2230,7 @@ int amdgpu_vm_handle_moved(struct amdgpu_device *adev,
 
 	list_for_each_entry_safe(bo_va, tmp, &vm->moved, base.vm_status) {
 		/* Per VM BOs never need to bo cleared in the page tables */
+		vm->va_updated = true;
 		r = amdgpu_vm_bo_update(adev, bo_va, false, NULL);
 		if (r)
 			return r;
@@ -2219,6 +2250,7 @@ int amdgpu_vm_handle_moved(struct amdgpu_device *adev,
 		else
 			clear = true;
 
+		vm->va_updated = true;
 		r = amdgpu_vm_bo_update(adev, bo_va, clear, NULL);
 		if (r)
 			return r;
@@ -2334,14 +2366,14 @@ int amdgpu_vm_bo_map(struct amdgpu_device *adev,
 	uint64_t eaddr;
 
 	/* validate the parameters */
-	if (saddr & ~PAGE_MASK || offset & ~PAGE_MASK || size & ~PAGE_MASK)
-		return -EINVAL;
-	if (saddr + size <= saddr || offset + size <= offset)
+	if (saddr & ~PAGE_MASK || offset & ~PAGE_MASK ||
+	    size == 0 || size & ~PAGE_MASK)
 		return -EINVAL;
 
 	/* make sure object fit at this offset */
 	eaddr = saddr + size - 1;
-	if ((bo && offset + size > amdgpu_bo_size(bo)) ||
+	if (saddr >= eaddr ||
+	    (bo && offset + size > amdgpu_bo_size(bo)) ||
 	    (eaddr >= adev->vm_manager.max_pfn << AMDGPU_GPU_PAGE_SHIFT))
 		return -EINVAL;
 
@@ -2400,14 +2432,14 @@ int amdgpu_vm_bo_replace_map(struct amdgpu_device *adev,
 	int r;
 
 	/* validate the parameters */
-	if (saddr & ~PAGE_MASK || offset & ~PAGE_MASK || size & ~PAGE_MASK)
-		return -EINVAL;
-	if (saddr + size <= saddr || offset + size <= offset)
+	if (saddr & ~PAGE_MASK || offset & ~PAGE_MASK ||
+	    size == 0 || size & ~PAGE_MASK)
 		return -EINVAL;
 
 	/* make sure object fit at this offset */
 	eaddr = saddr + size - 1;
-	if ((bo && offset + size > amdgpu_bo_size(bo)) ||
+	if (saddr >= eaddr ||
+	    (bo && offset + size > amdgpu_bo_size(bo)) ||
 	    (eaddr >= adev->vm_manager.max_pfn << AMDGPU_GPU_PAGE_SHIFT))
 		return -EINVAL;
 
@@ -2575,30 +2607,18 @@ int amdgpu_vm_bo_clear_mappings(struct amdgpu_device *adev,
 
 	/* Insert partial mapping before the range */
 	if (!list_empty(&before->list)) {
-		struct amdgpu_bo *bo = before->bo_va->base.bo;
-
 		amdgpu_vm_it_insert(before, &vm->va);
 		if (before->flags & AMDGPU_PTE_PRT)
 			amdgpu_vm_prt_get(adev);
-
-		if (bo && bo->tbo.base.resv == vm->root.bo->tbo.base.resv &&
-		    !before->bo_va->base.moved)
-			amdgpu_vm_bo_moved(&before->bo_va->base);
 	} else {
 		kfree(before);
 	}
 
 	/* Insert partial mapping after the range */
 	if (!list_empty(&after->list)) {
-		struct amdgpu_bo *bo = after->bo_va->base.bo;
-
 		amdgpu_vm_it_insert(after, &vm->va);
 		if (after->flags & AMDGPU_PTE_PRT)
 			amdgpu_vm_prt_get(adev);
-
-		if (bo && bo->tbo.base.resv == vm->root.bo->tbo.base.resv &&
-		    !after->bo_va->base.moved)
-			amdgpu_vm_bo_moved(&after->bo_va->base);
 	} else {
 		kfree(after);
 	}
@@ -2964,7 +2984,7 @@ int amdgpu_vm_init(struct amdgpu_device *adev, struct amdgpu_vm *vm)
 	vm->use_cpu_for_update = !!(adev->vm_manager.vm_update_mode &
 				    AMDGPU_VM_USE_CPU_FOR_GFX);
 
-	DRM_DEBUG_DRIVER("VM update mode is %s\n",
+	DRM_DEBUG("VM update mode is %s\n",
 			 vm->use_cpu_for_update ? "CPU" : "SDMA");
 	WARN_ONCE((vm->use_cpu_for_update &&
 		   !amdgpu_gmc_vram_full_visible(&adev->gmc)),
@@ -3099,7 +3119,7 @@ int amdgpu_vm_make_compute(struct amdgpu_device *adev, struct amdgpu_vm *vm)
 	/* Update VM state */
 	vm->use_cpu_for_update = !!(adev->vm_manager.vm_update_mode &
 				    AMDGPU_VM_USE_CPU_FOR_COMPUTE);
-	DRM_DEBUG_DRIVER("VM update mode is %s\n",
+	DRM_DEBUG("VM update mode is %s\n",
 			 vm->use_cpu_for_update ? "CPU" : "SDMA");
 	WARN_ONCE((vm->use_cpu_for_update &&
 		   !amdgpu_gmc_vram_full_visible(&adev->gmc)),
@@ -3169,6 +3189,8 @@ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm)
 	dma_fence_put(vm->last_unlocked);
 
 	list_for_each_entry_safe(mapping, tmp, &vm->freed, list) {
+		vm->va_updated = true;
+
 		if (mapping->flags & AMDGPU_PTE_PRT && prt_fini_needed) {
 			amdgpu_vm_prt_fini(adev, vm);
 			prt_fini_needed = false;
@@ -3235,11 +3257,7 @@ void amdgpu_vm_manager_init(struct amdgpu_device *adev)
 	 */
 #ifdef CONFIG_X86_64
 	if (amdgpu_vm_update_mode == -1) {
-		/* For asic with VF MMIO access protection
-		 * avoid using CPU for VM table updates
-		 */
-		if (amdgpu_gmc_vram_full_visible(&adev->gmc) &&
-		    !amdgpu_sriov_vf_mmio_access_protection(adev))
+		if (amdgpu_gmc_vram_full_visible(&adev->gmc))
 			adev->vm_manager.vm_update_mode =
 				AMDGPU_VM_USE_CPU_FOR_COMPUTE;
 		else
@@ -3247,7 +3265,11 @@ void amdgpu_vm_manager_init(struct amdgpu_device *adev)
 	} else
 		adev->vm_manager.vm_update_mode = amdgpu_vm_update_mode;
 #else
-	adev->vm_manager.vm_update_mode = 0;
+	if (adev->asic_type == CHIP_VANGOGH_LITE)
+		adev->vm_manager.vm_update_mode =
+			AMDGPU_VM_USE_CPU_FOR_GFX | AMDGPU_VM_USE_CPU_FOR_COMPUTE;
+	else
+		adev->vm_manager.vm_update_mode = 0;
 #endif
 
 	xa_init_flags(&adev->vm_manager.pasids, XA_FLAGS_LOCK_IRQ);
@@ -3285,10 +3307,6 @@ int amdgpu_vm_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
 	struct amdgpu_fpriv *fpriv = filp->driver_priv;
 	long timeout = msecs_to_jiffies(2000);
 	int r;
-
-	/* No valid flags defined yet */
-	if (args->in.flags)
-		return -EINVAL;
 
 	switch (args->in.op) {
 	case AMDGPU_VM_OP_RESERVE_VMID:

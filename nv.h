@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Advanced Micro Devices, Inc.
+ * Copyright 2019-2021 Advanced Micro Devices, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -39,5 +39,18 @@ int dimgrey_cavefish_reg_base_init(struct amdgpu_device *adev);
 int beige_goby_reg_base_init(struct amdgpu_device *adev);
 int yellow_carp_reg_base_init(struct amdgpu_device *adev);
 int cyan_skillfish_reg_base_init(struct amdgpu_device *adev);
+int vangogh_lite_reg_base_init(struct amdgpu_device *adev);
+void navi1x_soft_reset_SQG_workaround(struct amdgpu_device *adev);
+
+void vangogh_lite_gpu_hard_reset(struct amdgpu_device *adev);
+void vangogh_lite_gpu_soft_reset(struct amdgpu_device *adev);
+void vangogh_lite_gpu_quiesce(struct amdgpu_device *adev);
+
+void vangogh_lite_gc_update_median_grain_clock_gating(struct amdgpu_device *adev,
+										bool enable);
+void vangogh_lite_gc_clock_gating_workaround(struct amdgpu_device *adev);
+void vangogh_lite_gc_perfcounter_cg_workaround(struct amdgpu_device *adev,
+										bool enable);
+
 
 #endif

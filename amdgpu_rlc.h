@@ -35,26 +35,26 @@ typedef enum _FIRMWARE_ID_ {
 	FIRMWARE_ID_RLC_SRM_ARAM                                = 4,
 	FIRMWARE_ID_RLC_SRM_INDEX_ADDR                          = 5,
 	FIRMWARE_ID_RLC_SRM_INDEX_DATA                          = 6,
-	FIRMWARE_ID_RLC_P_UCODE                                 = 7,
-	FIRMWARE_ID_RLC_V_UCODE                                 = 8,
-	FIRMWARE_ID_RLX6_UCODE                                  = 9,
-	FIRMWARE_ID_RLX6_DRAM_BOOT                              = 10,
-	FIRMWARE_ID_GLOBAL_TAP_DELAYS                           = 11,
-	FIRMWARE_ID_SE0_TAP_DELAYS                              = 12,
-	FIRMWARE_ID_SE1_TAP_DELAYS                              = 13,
-	FIRMWARE_ID_GLOBAL_SE0_SE1_SKEW_DELAYS                  = 14,
-	FIRMWARE_ID_SDMA0_UCODE                                 = 15,
-	FIRMWARE_ID_SDMA0_JT                                    = 16,
-	FIRMWARE_ID_SDMA1_UCODE                                 = 17,
-	FIRMWARE_ID_SDMA1_JT                                    = 18,
-	FIRMWARE_ID_CP_CE                                       = 19,
-	FIRMWARE_ID_CP_PFP                                      = 20,
-	FIRMWARE_ID_CP_ME                                       = 21,
-	FIRMWARE_ID_CP_MEC                                      = 22,
-	FIRMWARE_ID_CP_MES                                      = 23,
-	FIRMWARE_ID_MES_STACK                                   = 24,
-	FIRMWARE_ID_RLC_SRM_DRAM_SR                             = 25,
-	FIRMWARE_ID_RLCG_SCRATCH_SR                             = 26,
+	FIRMWARE_ID_GLOBAL_TAP_DELAYS                           = 7,
+	FIRMWARE_ID_SE0_TAP_DELAYS                              = 8,
+	FIRMWARE_ID_CP_PFP                                      = 9,
+	FIRMWARE_ID_CP_ME                                       = 10,
+	FIRMWARE_ID_CP_MEC                                      = 11,
+	FIRMWARE_ID_RLC_SRM_DRAM_SR                             = 12,
+	FIRMWARE_ID_RLCG_SCRATCH_SR                             = 13,
+	FIRMWARE_ID_RLC_P_UCODE                                 = 14,
+	FIRMWARE_ID_RLC_V_UCODE                                 = 15,
+	FIRMWARE_ID_RLX6_UCODE                                  = 16,
+	FIRMWARE_ID_RLX6_DRAM_BOOT                              = 17,
+	FIRMWARE_ID_SE1_TAP_DELAYS                              = 18,
+	FIRMWARE_ID_GLOBAL_SE0_SE1_SKEW_DELAYS                  = 19,
+	FIRMWARE_ID_SDMA0_UCODE                                 = 20,
+	FIRMWARE_ID_SDMA0_JT                                    = 21,
+	FIRMWARE_ID_SDMA1_UCODE                                 = 22,
+	FIRMWARE_ID_SDMA1_JT                                    = 23,
+	FIRMWARE_ID_CP_CE                                       = 24,
+	FIRMWARE_ID_CP_MES                                      = 25,
+	FIRMWARE_ID_MES_STACK                                   = 26,
 	FIRMWARE_ID_RLCP_SCRATCH_SR                             = 27,
 	FIRMWARE_ID_RLCV_SCRATCH_SR                             = 28,
 	FIRMWARE_ID_RLX6_DRAM_SR                                = 29,
@@ -130,6 +130,7 @@ struct amdgpu_rlc_funcs {
 	void (*sriov_wreg)(struct amdgpu_device *adev, u32 offset, u32 v, u32 acc_flags, u32 hwip);
 	u32 (*sriov_rreg)(struct amdgpu_device *adev, u32 offset, u32 acc_flags, u32 hwip);
 	bool (*is_rlcg_access_range)(struct amdgpu_device *adev, uint32_t reg);
+	uint64_t (*get_pgd_addr)(struct amdgpu_device *adev, unsigned int vmid);
 };
 
 struct amdgpu_rlc {
@@ -186,11 +187,13 @@ struct amdgpu_rlc {
 	struct amdgpu_bo	*rlc_autoload_bo;
 	u64			rlc_autoload_gpu_addr;
 	void			*rlc_autoload_ptr;
+	uint32_t		autoload_size;
 
 	/* rlc toc buffer */
 	struct amdgpu_bo	*rlc_toc_bo;
 	uint64_t		rlc_toc_gpu_addr;
 	void			*rlc_toc_buf;
+	uint32_t		toc_size;
 };
 
 void amdgpu_gfx_rlc_enter_safe_mode(struct amdgpu_device *adev);

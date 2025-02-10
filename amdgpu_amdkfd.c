@@ -418,12 +418,7 @@ void amdgpu_amdkfd_get_local_mem_info(struct kgd_dev *kgd,
 
 	if (amdgpu_sriov_vf(adev))
 		mem_info->mem_clk_max = adev->clock.default_mclk / 100;
-	else if (adev->pm.dpm_enabled) {
-		if (amdgpu_emu_mode == 1)
-			mem_info->mem_clk_max = 0;
-		else
-			mem_info->mem_clk_max = amdgpu_dpm_get_mclk(adev, false) / 100;
-	} else
+	else
 		mem_info->mem_clk_max = 100;
 }
 
@@ -443,8 +438,6 @@ uint32_t amdgpu_amdkfd_get_max_engine_clock_in_mhz(struct kgd_dev *kgd)
 	/* the sclk is in quantas of 10kHz */
 	if (amdgpu_sriov_vf(adev))
 		return adev->clock.default_sclk / 100;
-	else if (adev->pm.dpm_enabled)
-		return amdgpu_dpm_get_sclk(adev, false) / 100;
 	else
 		return 100;
 }
@@ -590,60 +583,7 @@ int amdgpu_amdkfd_get_xgmi_bandwidth_mbytes(struct kgd_dev *dst, struct kgd_dev 
 
 int amdgpu_amdkfd_get_pcie_bandwidth_mbytes(struct kgd_dev *dev, bool is_min)
 {
-	struct amdgpu_device *adev = (struct amdgpu_device *)dev;
-	int num_lanes_shift = (is_min ? ffs(adev->pm.pcie_mlw_mask) :
-							fls(adev->pm.pcie_mlw_mask)) - 1;
-	int gen_speed_shift = (is_min ? ffs(adev->pm.pcie_gen_mask &
-						CAIL_PCIE_LINK_SPEED_SUPPORT_MASK) :
-					fls(adev->pm.pcie_gen_mask &
-						CAIL_PCIE_LINK_SPEED_SUPPORT_MASK)) - 1;
-	uint32_t num_lanes_mask = 1 << num_lanes_shift;
-	uint32_t gen_speed_mask = 1 << gen_speed_shift;
-	int num_lanes_factor = 0, gen_speed_mbits_factor = 0;
-
-	switch (num_lanes_mask) {
-	case CAIL_PCIE_LINK_WIDTH_SUPPORT_X1:
-		num_lanes_factor = 1;
-		break;
-	case CAIL_PCIE_LINK_WIDTH_SUPPORT_X2:
-		num_lanes_factor = 2;
-		break;
-	case CAIL_PCIE_LINK_WIDTH_SUPPORT_X4:
-		num_lanes_factor = 4;
-		break;
-	case CAIL_PCIE_LINK_WIDTH_SUPPORT_X8:
-		num_lanes_factor = 8;
-		break;
-	case CAIL_PCIE_LINK_WIDTH_SUPPORT_X12:
-		num_lanes_factor = 12;
-		break;
-	case CAIL_PCIE_LINK_WIDTH_SUPPORT_X16:
-		num_lanes_factor = 16;
-		break;
-	case CAIL_PCIE_LINK_WIDTH_SUPPORT_X32:
-		num_lanes_factor = 32;
-		break;
-	}
-
-	switch (gen_speed_mask) {
-	case CAIL_PCIE_LINK_SPEED_SUPPORT_GEN1:
-		gen_speed_mbits_factor = 2500;
-		break;
-	case CAIL_PCIE_LINK_SPEED_SUPPORT_GEN2:
-		gen_speed_mbits_factor = 5000;
-		break;
-	case CAIL_PCIE_LINK_SPEED_SUPPORT_GEN3:
-		gen_speed_mbits_factor = 8000;
-		break;
-	case CAIL_PCIE_LINK_SPEED_SUPPORT_GEN4:
-		gen_speed_mbits_factor = 16000;
-		break;
-	case CAIL_PCIE_LINK_SPEED_SUPPORT_GEN5:
-		gen_speed_mbits_factor = 32000;
-		break;
-	}
-
-	return (num_lanes_factor * gen_speed_mbits_factor)/BITS_PER_BYTE;
+	return 0;
 }
 
 uint64_t amdgpu_amdkfd_get_mmio_remap_phys_addr(struct kgd_dev *kgd)
@@ -731,11 +671,6 @@ err:
 
 void amdgpu_amdkfd_set_compute_idle(struct kgd_dev *kgd, bool idle)
 {
-	struct amdgpu_device *adev = (struct amdgpu_device *)kgd;
-
-	amdgpu_dpm_switch_power_profile(adev,
-					PP_SMC_POWER_PROFILE_COMPUTE,
-					!idle);
 }
 
 bool amdgpu_amdkfd_is_kfd_vmid(struct amdgpu_device *adev, u32 vmid)
@@ -768,8 +703,7 @@ int amdgpu_amdkfd_flush_gpu_tlb_pasid(struct kgd_dev *kgd, uint16_t pasid,
 	struct amdgpu_device *adev = (struct amdgpu_device *)kgd;
 	bool all_hub = false;
 
-	if (adev->family == AMDGPU_FAMILY_AI ||
-	    adev->family == AMDGPU_FAMILY_RV)
+	if (adev->family == AMDGPU_FAMILY_AI)
 		all_hub = true;
 
 	return amdgpu_gmc_flush_gpu_tlb_pasid(adev, pasid, flush_type, all_hub);

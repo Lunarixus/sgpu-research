@@ -54,11 +54,6 @@ static void hdp_v5_0_update_mem_power_gating(struct amdgpu_device *adev,
 	uint32_t hdp_clk_cntl, hdp_clk_cntl1;
 	uint32_t hdp_mem_pwr_cntl;
 
-	if (!(adev->cg_flags & (AMD_CG_SUPPORT_HDP_LS |
-				AMD_CG_SUPPORT_HDP_DS |
-				AMD_CG_SUPPORT_HDP_SD)))
-		return;
-
 	hdp_clk_cntl = hdp_clk_cntl1 = RREG32_SOC15(HDP, 0, mmHDP_CLK_CNTL);
 	hdp_mem_pwr_cntl = RREG32_SOC15(HDP, 0, mmHDP_MEM_POWER_CTRL);
 
@@ -90,50 +85,6 @@ static void hdp_v5_0_update_mem_power_gating(struct amdgpu_device *adev,
 					 RC_MEM_POWER_SD_EN, 0);
 	WREG32_SOC15(HDP, 0, mmHDP_MEM_POWER_CTRL, hdp_mem_pwr_cntl);
 
-	/* Already disabled above. The actions below are for "enabled" only */
-	if (enable) {
-		/* only one clock gating mode (LS/DS/SD) can be enabled */
-		if (adev->cg_flags & AMD_CG_SUPPORT_HDP_LS) {
-			hdp_mem_pwr_cntl = REG_SET_FIELD(hdp_mem_pwr_cntl,
-							 HDP_MEM_POWER_CTRL,
-							 IPH_MEM_POWER_LS_EN, 1);
-			hdp_mem_pwr_cntl = REG_SET_FIELD(hdp_mem_pwr_cntl,
-							 HDP_MEM_POWER_CTRL,
-							 RC_MEM_POWER_LS_EN, 1);
-		} else if (adev->cg_flags & AMD_CG_SUPPORT_HDP_DS) {
-			hdp_mem_pwr_cntl = REG_SET_FIELD(hdp_mem_pwr_cntl,
-							 HDP_MEM_POWER_CTRL,
-							 IPH_MEM_POWER_DS_EN, 1);
-			hdp_mem_pwr_cntl = REG_SET_FIELD(hdp_mem_pwr_cntl,
-							 HDP_MEM_POWER_CTRL,
-							 RC_MEM_POWER_DS_EN, 1);
-		} else if (adev->cg_flags & AMD_CG_SUPPORT_HDP_SD) {
-			hdp_mem_pwr_cntl = REG_SET_FIELD(hdp_mem_pwr_cntl,
-							 HDP_MEM_POWER_CTRL,
-							 IPH_MEM_POWER_SD_EN, 1);
-			/* RC should not use shut down mode, fallback to ds  or ls if allowed */
-			if (adev->cg_flags & AMD_CG_SUPPORT_HDP_DS)
-				hdp_mem_pwr_cntl = REG_SET_FIELD(hdp_mem_pwr_cntl,
-								 HDP_MEM_POWER_CTRL,
-								 RC_MEM_POWER_DS_EN, 1);
-			else if (adev->cg_flags & AMD_CG_SUPPORT_HDP_LS)
-				hdp_mem_pwr_cntl = REG_SET_FIELD(hdp_mem_pwr_cntl,
-								 HDP_MEM_POWER_CTRL,
-								 RC_MEM_POWER_LS_EN, 1);
-		}
-
-		/* confirmed that IPH_MEM_POWER_CTRL_EN and RC_MEM_POWER_CTRL_EN have to
-		 * be set for SRAM LS/DS/SD */
-		if (adev->cg_flags & (AMD_CG_SUPPORT_HDP_LS | AMD_CG_SUPPORT_HDP_DS |
-				      AMD_CG_SUPPORT_HDP_SD)) {
-			hdp_mem_pwr_cntl = REG_SET_FIELD(hdp_mem_pwr_cntl, HDP_MEM_POWER_CTRL,
-							 IPH_MEM_POWER_CTRL_EN, 1);
-			hdp_mem_pwr_cntl = REG_SET_FIELD(hdp_mem_pwr_cntl, HDP_MEM_POWER_CTRL,
-							 RC_MEM_POWER_CTRL_EN, 1);
-			WREG32_SOC15(HDP, 0, mmHDP_MEM_POWER_CTRL, hdp_mem_pwr_cntl);
-		}
-	}
-
 	/* disable IPH & RC clock override after clock/power mode changing */
 	hdp_clk_cntl = REG_SET_FIELD(hdp_clk_cntl, HDP_CLK_CNTL,
 				     IPH_MEM_CLK_SOFT_OVERRIDE, 0);
@@ -146,9 +97,6 @@ static void hdp_v5_0_update_medium_grain_clock_gating(struct amdgpu_device *adev
 						      bool enable)
 {
 	uint32_t hdp_clk_cntl;
-
-	if (!(adev->cg_flags & AMD_CG_SUPPORT_HDP_MGCG))
-		return;
 
 	hdp_clk_cntl = RREG32_SOC15(HDP, 0, mmHDP_CLK_CNTL);
 

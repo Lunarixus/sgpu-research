@@ -476,7 +476,6 @@ error_free:
 	while (i--)
 		drm_mm_remove_node(&node->mm_nodes[i]);
 	spin_unlock(&mgr->lock);
-	ttm_resource_fini(man, &node->base);
 	kvfree(node);
 
 error_sub:
@@ -516,7 +515,6 @@ static void amdgpu_vram_mgr_del(struct ttm_resource_manager *man,
 	atomic64_sub(usage, &mgr->usage);
 	atomic64_sub(vis_usage, &mgr->vis_usage);
 
-	ttm_resource_fini(man, res);
 	kvfree(node);
 }
 
@@ -642,6 +640,9 @@ uint64_t amdgpu_vram_mgr_usage(struct ttm_resource_manager *man)
 {
 	struct amdgpu_vram_mgr *mgr = to_vram_mgr(man);
 
+	if (amdgpu_force_gtt)
+		return 0;
+
 	return atomic64_read(&mgr->usage);
 }
 
@@ -655,6 +656,9 @@ uint64_t amdgpu_vram_mgr_usage(struct ttm_resource_manager *man)
 uint64_t amdgpu_vram_mgr_vis_usage(struct ttm_resource_manager *man)
 {
 	struct amdgpu_vram_mgr *mgr = to_vram_mgr(man);
+
+	if (amdgpu_force_gtt)
+		return 0;
 
 	return atomic64_read(&mgr->vis_usage);
 }

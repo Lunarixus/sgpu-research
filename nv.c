@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Advanced Micro Devices, Inc.
+ * Copyright 2019-2022 Advanced Micro Devices, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -37,8 +37,8 @@
 #include "atom.h"
 #include "amd_pcie.h"
 
-#include "gc/gc_10_1_0_offset.h"
-#include "gc/gc_10_1_0_sh_mask.h"
+#include "gc/gc_10_4_0_offset.h"
+#include "gc/gc_10_4_0_sh_mask.h"
 #include "mp/mp_11_0_offset.h"
 
 #include "soc15.h"
@@ -49,6 +49,7 @@
 #include "nbio_v2_3.h"
 #include "nbio_v7_2.h"
 #include "hdp_v5_0.h"
+#include "hdp_dummy.h"
 #include "nv.h"
 #include "navi10_ih.h"
 #include "gfx_v10_0.h"
@@ -63,6 +64,7 @@
 #include "mxgpu_nv.h"
 #include "smuio_v11_0.h"
 #include "smuio_v11_0_6.h"
+#include "vangogh_lite_ih.h"
 
 static const struct amd_ip_funcs nv_common_ip_funcs;
 
@@ -170,7 +172,6 @@ static const struct amdgpu_video_codec_info yc_video_codecs_decode_array[] = {
 	{codec_info_build(AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_HEVC, 8192, 4352, 186)},
 	{codec_info_build(AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_VP9, 8192, 4352, 0)},
 	{codec_info_build(AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_JPEG, 4096, 4096, 0)},
-	{codec_info_build(AMDGPU_INFO_VIDEO_CAPS_CODEC_IDX_AV1, 8192, 4352, 0)},
 };
 
 static const struct amdgpu_video_codecs yc_video_codecs_decode = {
@@ -334,7 +335,14 @@ static u32 nv_get_config_memsize(struct amdgpu_device *adev)
 
 static u32 nv_get_xclk(struct amdgpu_device *adev)
 {
-	return adev->clock.spll.reference_freq;
+	/* On Mariner EMU, there is no SMU and VBIOS, so we need to
+	 * set hardcocde for xclk.
+	 * The value confirmed by HW team is 26M
+	 */
+	if (adev->asic_type == CHIP_VANGOGH_LITE)
+		return 2560;
+	else
+		return adev->clock.spll.reference_freq;
 }
 
 
@@ -455,6 +463,7 @@ static int nv_read_register(struct amdgpu_device *adev, u32 se_num,
 	for (i = 0; i < ARRAY_SIZE(nv_allowed_read_registers); i++) {
 		en = &nv_allowed_read_registers[i];
 		if ((i == 7 && (adev->sdma.num_instances == 1)) || /* some asics don't have SDMA1 */
+		    (adev->asic_type == CHIP_VANGOGH_LITE && en->hwip != GC_HWIP) ||
 		    reg_offset !=
 		    (adev->reg_offset[en->hwip][en->inst][en->seg] + en->reg_offset))
 			continue;
@@ -474,17 +483,6 @@ static int nv_asic_mode2_reset(struct amdgpu_device *adev)
 
 	amdgpu_atombios_scratch_regs_engine_hung(adev, true);
 
-	/* disable BM */
-	pci_clear_master(adev->pdev);
-
-	amdgpu_device_cache_pci_state(adev->pdev);
-
-	ret = amdgpu_dpm_mode2_reset(adev);
-	if (ret)
-		dev_err(adev->dev, "GPU mode2 reset failed\n");
-
-	amdgpu_device_load_pci_state(adev->pdev);
-
 	/* wait for asic to come out of reset */
 	for (i = 0; i < adev->usec_timeout; i++) {
 		u32 memsize = adev->nbio.funcs->get_memsize(adev);
@@ -502,6 +500,9 @@ static int nv_asic_mode2_reset(struct amdgpu_device *adev)
 static enum amd_reset_method
 nv_asic_reset_method(struct amdgpu_device *adev)
 {
+	if (adev->asic_type == CHIP_VANGOGH_LITE)
+		return AMD_RESET_METHOD_MARINER_GOPHER;
+
 	if (amdgpu_reset_method == AMD_RESET_METHOD_MODE1 ||
 	    amdgpu_reset_method == AMD_RESET_METHOD_MODE2 ||
 	    amdgpu_reset_method == AMD_RESET_METHOD_BACO ||
@@ -522,29 +523,36 @@ nv_asic_reset_method(struct amdgpu_device *adev)
 	case CHIP_BEIGE_GOBY:
 		return AMD_RESET_METHOD_MODE1;
 	default:
-		if (amdgpu_dpm_is_baco_supported(adev))
-			return AMD_RESET_METHOD_BACO;
-		else
-			return AMD_RESET_METHOD_MODE1;
+		return AMD_RESET_METHOD_MODE1;
 	}
 }
 
 static int nv_asic_reset(struct amdgpu_device *adev)
 {
+	int i;
 	int ret = 0;
+
+	return ret;
 
 	switch (nv_asic_reset_method(adev)) {
 	case AMD_RESET_METHOD_PCI:
 		dev_info(adev->dev, "PCI reset\n");
 		ret = amdgpu_device_pci_reset(adev);
 		break;
-	case AMD_RESET_METHOD_BACO:
-		dev_info(adev->dev, "BACO reset\n");
-		ret = amdgpu_dpm_baco_reset(adev);
-		break;
 	case AMD_RESET_METHOD_MODE2:
 		dev_info(adev->dev, "MODE2 reset\n");
 		ret = nv_asic_mode2_reset(adev);
+		break;
+	case AMD_RESET_METHOD_MARINER_GOPHER:
+		/* Here is where we initiate the IFPO reset.  Currently
+		 * on Gopher, we run a script externally.  The
+		 * loop below is to give enough time to run the hard
+		 * reset script. */
+		for (i = 0; i < 10000; i++) {
+			udelay(1000);
+			if ( i % 1000 == 0)
+				DRM_INFO("***Run Hard Reset Script Now!!!***  %d/10000\n", i);
+		}
 		break;
 	default:
 		dev_info(adev->dev, "MODE1 reset\n");
@@ -553,6 +561,56 @@ static int nv_asic_reset(struct amdgpu_device *adev)
 	}
 
 	return ret;
+}
+
+/*
+ * navi1x_soft_reset_SQG_workaround
+ *
+ * Description:  The SQG block maintains a copy of
+ *    CC_GC_SHADER_ARRAY_CONFIG and
+ *    GC_USER_SHADER_ARRAY_CONFIG registers.
+ *  These registers inform SQG which workgroup are
+ *  active and which are inactive.  After soft reset,
+ *  these registers are reset to default values which
+ *  is all workgroup active.  This should not happen
+ *  according to design rules.  As a result, it can
+ *  cause a hang due to Xnack Override exit logic
+ *  waiting for response from all active workgroups.
+ *  But inactive workgroups do not response and so
+ *  the wait will be forever.
+ * Workaround: Re-write these registers so the SQG
+ *  will pick up the values again.
+ */
+void navi1x_soft_reset_SQG_workaround(struct amdgpu_device *adev)
+{
+	u32 i, j;
+	u32 tmp;
+	u32 cc_gc_shader_array_config = 0;
+	u32 gc_user_shader_array_config = 0;
+
+	if (!(adev->asic_type == CHIP_NAVI10 ||
+		adev->asic_type == CHIP_NAVI14 ||
+		adev->asic_type == CHIP_NAVI12))
+		return;
+
+	cc_gc_shader_array_config =
+		SOC15_REG_OFFSET(GC, 0, mmCC_GC_SHADER_ARRAY_CONFIG);
+	gc_user_shader_array_config =
+		SOC15_REG_OFFSET(GC, 0, mmGC_USER_SHADER_ARRAY_CONFIG);
+
+	mutex_lock(&adev->grbm_idx_mutex);
+	for (i = 0; i < adev->gfx.config.max_shader_engines; i++) {
+		for (j = 0; j < adev->gfx.config.max_sh_per_se; j++) {
+			amdgpu_gfx_select_se_sh(adev, i, j, 0xffffffff);
+			/* re-write these registers */
+			tmp = RREG32(cc_gc_shader_array_config);
+			WREG32(cc_gc_shader_array_config, tmp);
+			tmp = RREG32(gc_user_shader_array_config);
+			WREG32(gc_user_shader_array_config, tmp);
+		}
+	}
+	amdgpu_gfx_select_se_sh(adev, 0xffffffff, 0xffffffff, 0xffffffff);
+	mutex_unlock(&adev->grbm_idx_mutex);
 }
 
 static int nv_set_uvd_clocks(struct amdgpu_device *adev, u32 vclk, u32 dclk)
@@ -575,16 +633,15 @@ static void nv_pcie_gen3_enable(struct amdgpu_device *adev)
 	if (amdgpu_pcie_gen2 == 0)
 		return;
 
-	if (!(adev->pm.pcie_gen_mask & (CAIL_PCIE_LINK_SPEED_SUPPORT_GEN2 |
-					CAIL_PCIE_LINK_SPEED_SUPPORT_GEN3)))
-		return;
-
 	/* todo */
 }
 
 static void nv_program_aspm(struct amdgpu_device *adev)
 {
-	if (!amdgpu_device_should_use_aspm(adev) || !amdgpu_device_aspm_support_quirk())
+	if (!amdgpu_aspm)
+		return;
+
+	if (!adev->pdev)
 		return;
 
 	if (!(adev->flags & AMD_IS_APU) &&
@@ -653,7 +710,6 @@ legacy_init:
 		break;
 	case CHIP_SIENNA_CICHLID:
 	case CHIP_NAVY_FLOUNDER:
-		sienna_cichlid_reg_base_init(adev);
 		break;
 	case CHIP_VANGOGH:
 		vangogh_reg_base_init(adev);
@@ -662,13 +718,13 @@ legacy_init:
 		dimgrey_cavefish_reg_base_init(adev);
 		break;
 	case CHIP_BEIGE_GOBY:
-		beige_goby_reg_base_init(adev);
 		break;
 	case CHIP_YELLOW_CARP:
-		yellow_carp_reg_base_init(adev);
 		break;
 	case CHIP_CYAN_SKILLFISH:
-		cyan_skillfish_reg_base_init(adev);
+		break;
+	case CHIP_VANGOGH_LITE:
+		vangogh_lite_reg_base_init(adev);
 		break;
 	default:
 		return -EINVAL;
@@ -696,12 +752,11 @@ int nv_set_ip_blocks(struct amdgpu_device *adev)
 		adev->nbio.funcs = &nbio_v2_3_funcs;
 		adev->nbio.hdp_flush_reg = &nbio_v2_3_hdp_flush_reg;
 	}
-	adev->hdp.funcs = &hdp_v5_0_funcs;
 
-	if (adev->asic_type >= CHIP_SIENNA_CICHLID)
-		adev->smuio.funcs = &smuio_v11_0_6_funcs;
+	if (adev->asic_type == CHIP_VANGOGH_LITE)
+		adev->hdp.funcs = &hdp_dummy_funcs;
 	else
-		adev->smuio.funcs = &smuio_v11_0_funcs;
+		adev->hdp.funcs = &hdp_v5_0_funcs;
 
 	if (adev->asic_type == CHIP_SIENNA_CICHLID)
 		adev->gmc.xgmi.supported = true;
@@ -716,11 +771,7 @@ int nv_set_ip_blocks(struct amdgpu_device *adev)
 	case CHIP_NAVI14:
 		amdgpu_device_ip_block_add(adev, &nv_common_ip_block);
 		amdgpu_device_ip_block_add(adev, &gmc_v10_0_ip_block);
-		amdgpu_device_ip_block_add(adev, &navi10_ih_ip_block);
 		amdgpu_device_ip_block_add(adev, &psp_v11_0_ip_block);
-		if (adev->firmware.load_type == AMDGPU_FW_LOAD_PSP &&
-		    !amdgpu_sriov_vf(adev))
-			amdgpu_device_ip_block_add(adev, &smu_v11_0_ip_block);
 		if (adev->enable_virtual_display || amdgpu_sriov_vf(adev))
 			amdgpu_device_ip_block_add(adev, &amdgpu_vkms_ip_block);
 #if defined(CONFIG_DRM_AMD_DC)
@@ -729,26 +780,15 @@ int nv_set_ip_blocks(struct amdgpu_device *adev)
 #endif
 		amdgpu_device_ip_block_add(adev, &gfx_v10_0_ip_block);
 		amdgpu_device_ip_block_add(adev, &sdma_v5_0_ip_block);
-		if (adev->firmware.load_type == AMDGPU_FW_LOAD_DIRECT &&
-		    !amdgpu_sriov_vf(adev))
-			amdgpu_device_ip_block_add(adev, &smu_v11_0_ip_block);
-		amdgpu_device_ip_block_add(adev, &vcn_v2_0_ip_block);
-		amdgpu_device_ip_block_add(adev, &jpeg_v2_0_ip_block);
-		if (adev->enable_mes)
-			amdgpu_device_ip_block_add(adev, &mes_v10_1_ip_block);
 		break;
 	case CHIP_NAVI12:
 		amdgpu_device_ip_block_add(adev, &nv_common_ip_block);
 		amdgpu_device_ip_block_add(adev, &gmc_v10_0_ip_block);
 		if (!amdgpu_sriov_vf(adev)) {
-			amdgpu_device_ip_block_add(adev, &navi10_ih_ip_block);
 			amdgpu_device_ip_block_add(adev, &psp_v11_0_ip_block);
-		} else {
+		} else
 			amdgpu_device_ip_block_add(adev, &psp_v11_0_ip_block);
-			amdgpu_device_ip_block_add(adev, &navi10_ih_ip_block);
-		}
-		if (adev->firmware.load_type == AMDGPU_FW_LOAD_PSP)
-			amdgpu_device_ip_block_add(adev, &smu_v11_0_ip_block);
+
 		if (adev->enable_virtual_display || amdgpu_sriov_vf(adev))
 			amdgpu_device_ip_block_add(adev, &amdgpu_vkms_ip_block);
 #if defined(CONFIG_DRM_AMD_DC)
@@ -757,28 +797,17 @@ int nv_set_ip_blocks(struct amdgpu_device *adev)
 #endif
 		amdgpu_device_ip_block_add(adev, &gfx_v10_0_ip_block);
 		amdgpu_device_ip_block_add(adev, &sdma_v5_0_ip_block);
-		if (adev->firmware.load_type == AMDGPU_FW_LOAD_DIRECT &&
-		    !amdgpu_sriov_vf(adev))
-			amdgpu_device_ip_block_add(adev, &smu_v11_0_ip_block);
-		amdgpu_device_ip_block_add(adev, &vcn_v2_0_ip_block);
-		if (!amdgpu_sriov_vf(adev))
-			amdgpu_device_ip_block_add(adev, &jpeg_v2_0_ip_block);
 		break;
 	case CHIP_SIENNA_CICHLID:
 		amdgpu_device_ip_block_add(adev, &nv_common_ip_block);
 		amdgpu_device_ip_block_add(adev, &gmc_v10_0_ip_block);
 		if (!amdgpu_sriov_vf(adev)) {
-			amdgpu_device_ip_block_add(adev, &navi10_ih_ip_block);
 			if (likely(adev->firmware.load_type == AMDGPU_FW_LOAD_PSP))
 				amdgpu_device_ip_block_add(adev, &psp_v11_0_ip_block);
 		} else {
 			if (likely(adev->firmware.load_type == AMDGPU_FW_LOAD_PSP))
 				amdgpu_device_ip_block_add(adev, &psp_v11_0_ip_block);
-			amdgpu_device_ip_block_add(adev, &navi10_ih_ip_block);
 		}
-		if (adev->firmware.load_type == AMDGPU_FW_LOAD_PSP &&
-		    is_support_sw_smu(adev))
-			amdgpu_device_ip_block_add(adev, &smu_v11_0_ip_block);
 		if (adev->enable_virtual_display || amdgpu_sriov_vf(adev))
 			amdgpu_device_ip_block_add(adev, &amdgpu_vkms_ip_block);
 #if defined(CONFIG_DRM_AMD_DC)
@@ -787,21 +816,12 @@ int nv_set_ip_blocks(struct amdgpu_device *adev)
 #endif
 		amdgpu_device_ip_block_add(adev, &gfx_v10_0_ip_block);
 		amdgpu_device_ip_block_add(adev, &sdma_v5_2_ip_block);
-		amdgpu_device_ip_block_add(adev, &vcn_v3_0_ip_block);
-		if (!amdgpu_sriov_vf(adev))
-			amdgpu_device_ip_block_add(adev, &jpeg_v3_0_ip_block);
-		if (adev->enable_mes)
-			amdgpu_device_ip_block_add(adev, &mes_v10_1_ip_block);
 		break;
 	case CHIP_NAVY_FLOUNDER:
 		amdgpu_device_ip_block_add(adev, &nv_common_ip_block);
 		amdgpu_device_ip_block_add(adev, &gmc_v10_0_ip_block);
-		amdgpu_device_ip_block_add(adev, &navi10_ih_ip_block);
 		if (likely(adev->firmware.load_type == AMDGPU_FW_LOAD_PSP))
 			amdgpu_device_ip_block_add(adev, &psp_v11_0_ip_block);
-		if (adev->firmware.load_type == AMDGPU_FW_LOAD_PSP &&
-		    is_support_sw_smu(adev))
-			amdgpu_device_ip_block_add(adev, &smu_v11_0_ip_block);
 		if (adev->enable_virtual_display || amdgpu_sriov_vf(adev))
 			amdgpu_device_ip_block_add(adev, &amdgpu_vkms_ip_block);
 #if defined(CONFIG_DRM_AMD_DC)
@@ -810,19 +830,10 @@ int nv_set_ip_blocks(struct amdgpu_device *adev)
 #endif
 		amdgpu_device_ip_block_add(adev, &gfx_v10_0_ip_block);
 		amdgpu_device_ip_block_add(adev, &sdma_v5_2_ip_block);
-		amdgpu_device_ip_block_add(adev, &vcn_v3_0_ip_block);
-		amdgpu_device_ip_block_add(adev, &jpeg_v3_0_ip_block);
-		if (adev->firmware.load_type == AMDGPU_FW_LOAD_DIRECT &&
-		    is_support_sw_smu(adev))
-			amdgpu_device_ip_block_add(adev, &smu_v11_0_ip_block);
 		break;
 	case CHIP_VANGOGH:
 		amdgpu_device_ip_block_add(adev, &nv_common_ip_block);
 		amdgpu_device_ip_block_add(adev, &gmc_v10_0_ip_block);
-		amdgpu_device_ip_block_add(adev, &navi10_ih_ip_block);
-		if (likely(adev->firmware.load_type == AMDGPU_FW_LOAD_PSP))
-			amdgpu_device_ip_block_add(adev, &psp_v11_0_ip_block);
-		amdgpu_device_ip_block_add(adev, &smu_v11_0_ip_block);
 		if (adev->enable_virtual_display || amdgpu_sriov_vf(adev))
 			amdgpu_device_ip_block_add(adev, &amdgpu_vkms_ip_block);
 #if defined(CONFIG_DRM_AMD_DC)
@@ -831,18 +842,21 @@ int nv_set_ip_blocks(struct amdgpu_device *adev)
 #endif
 		amdgpu_device_ip_block_add(adev, &gfx_v10_0_ip_block);
 		amdgpu_device_ip_block_add(adev, &sdma_v5_2_ip_block);
-		amdgpu_device_ip_block_add(adev, &vcn_v3_0_ip_block);
-		amdgpu_device_ip_block_add(adev, &jpeg_v3_0_ip_block);
+		break;
+	case CHIP_VANGOGH_LITE:
+		amdgpu_device_ip_block_add(adev, &nv_common_ip_block);
+		amdgpu_device_ip_block_add(adev, &gmc_v10_0_ip_block);
+		if (!amdgpu_poll_eop)
+			amdgpu_device_ip_block_add(adev, &vangogh_lite_ih_ip_block);
+		if (adev->enable_virtual_display)
+			amdgpu_device_ip_block_add(adev, &amdgpu_vkms_ip_block);
+		amdgpu_device_ip_block_add(adev, &gfx_v10_0_ip_block);
 		break;
 	case CHIP_DIMGREY_CAVEFISH:
 		amdgpu_device_ip_block_add(adev, &nv_common_ip_block);
 		amdgpu_device_ip_block_add(adev, &gmc_v10_0_ip_block);
-		amdgpu_device_ip_block_add(adev, &navi10_ih_ip_block);
 		if (likely(adev->firmware.load_type == AMDGPU_FW_LOAD_PSP))
 			amdgpu_device_ip_block_add(adev, &psp_v11_0_ip_block);
-		if (adev->firmware.load_type == AMDGPU_FW_LOAD_PSP &&
-		    is_support_sw_smu(adev))
-			amdgpu_device_ip_block_add(adev, &smu_v11_0_ip_block);
 		if (adev->enable_virtual_display || amdgpu_sriov_vf(adev))
 			amdgpu_device_ip_block_add(adev, &amdgpu_vkms_ip_block);
 #if defined(CONFIG_DRM_AMD_DC)
@@ -851,18 +865,12 @@ int nv_set_ip_blocks(struct amdgpu_device *adev)
 #endif
 		amdgpu_device_ip_block_add(adev, &gfx_v10_0_ip_block);
 		amdgpu_device_ip_block_add(adev, &sdma_v5_2_ip_block);
-		amdgpu_device_ip_block_add(adev, &vcn_v3_0_ip_block);
-		amdgpu_device_ip_block_add(adev, &jpeg_v3_0_ip_block);
 		break;
 	case CHIP_BEIGE_GOBY:
 		amdgpu_device_ip_block_add(adev, &nv_common_ip_block);
 		amdgpu_device_ip_block_add(adev, &gmc_v10_0_ip_block);
-		amdgpu_device_ip_block_add(adev, &navi10_ih_ip_block);
 		if (likely(adev->firmware.load_type == AMDGPU_FW_LOAD_PSP))
 			amdgpu_device_ip_block_add(adev, &psp_v11_0_ip_block);
-		if (adev->firmware.load_type == AMDGPU_FW_LOAD_PSP &&
-		    is_support_sw_smu(adev))
-			amdgpu_device_ip_block_add(adev, &smu_v11_0_ip_block);
 		amdgpu_device_ip_block_add(adev, &gfx_v10_0_ip_block);
 		amdgpu_device_ip_block_add(adev, &sdma_v5_2_ip_block);
 		if (adev->enable_virtual_display || amdgpu_sriov_vf(adev))
@@ -871,18 +879,10 @@ int nv_set_ip_blocks(struct amdgpu_device *adev)
 		else if (amdgpu_device_has_dc_support(adev))
 			amdgpu_device_ip_block_add(adev, &dm_ip_block);
 #endif
-		if (adev->firmware.load_type == AMDGPU_FW_LOAD_DIRECT &&
-		    is_support_sw_smu(adev))
-			amdgpu_device_ip_block_add(adev, &smu_v11_0_ip_block);
-		amdgpu_device_ip_block_add(adev, &vcn_v3_0_ip_block);
 		break;
 	case CHIP_YELLOW_CARP:
 		amdgpu_device_ip_block_add(adev, &nv_common_ip_block);
 		amdgpu_device_ip_block_add(adev, &gmc_v10_0_ip_block);
-		amdgpu_device_ip_block_add(adev, &navi10_ih_ip_block);
-		if (likely(adev->firmware.load_type == AMDGPU_FW_LOAD_PSP))
-			amdgpu_device_ip_block_add(adev, &psp_v13_0_ip_block);
-		amdgpu_device_ip_block_add(adev, &smu_v13_0_ip_block);
 		if (adev->enable_virtual_display || amdgpu_sriov_vf(adev))
 			amdgpu_device_ip_block_add(adev, &amdgpu_vkms_ip_block);
 		amdgpu_device_ip_block_add(adev, &gfx_v10_0_ip_block);
@@ -893,18 +893,10 @@ int nv_set_ip_blocks(struct amdgpu_device *adev)
 		else if (amdgpu_device_has_dc_support(adev))
 			amdgpu_device_ip_block_add(adev, &dm_ip_block);
 #endif
-		amdgpu_device_ip_block_add(adev, &vcn_v3_0_ip_block);
-		amdgpu_device_ip_block_add(adev, &jpeg_v3_0_ip_block);
 		break;
 	case CHIP_CYAN_SKILLFISH:
 		amdgpu_device_ip_block_add(adev, &nv_common_ip_block);
 		amdgpu_device_ip_block_add(adev, &gmc_v10_0_ip_block);
-		amdgpu_device_ip_block_add(adev, &navi10_ih_ip_block);
-		if (adev->apu_flags & AMD_APU_IS_CYAN_SKILLFISH2) {
-			if (likely(adev->firmware.load_type == AMDGPU_FW_LOAD_PSP))
-				amdgpu_device_ip_block_add(adev, &psp_v11_0_8_ip_block);
-			amdgpu_device_ip_block_add(adev, &smu_v11_0_ip_block);
-		}
 		if (adev->enable_virtual_display || amdgpu_sriov_vf(adev))
 			amdgpu_device_ip_block_add(adev, &amdgpu_vkms_ip_block);
 		amdgpu_device_ip_block_add(adev, &gfx_v10_0_ip_block);
@@ -919,19 +911,28 @@ int nv_set_ip_blocks(struct amdgpu_device *adev)
 
 static uint32_t nv_get_rev_id(struct amdgpu_device *adev)
 {
-	return adev->nbio.funcs->get_rev_id(adev);
+	return adev->nbio.funcs->get_chip_revision(adev);
 }
 
 static bool nv_need_full_reset(struct amdgpu_device *adev)
 {
-	return true;
+	bool r = true;
+	switch (adev->asic_type) {
+		case CHIP_NAVI14:
+		case CHIP_VANGOGH_LITE:
+			r = (amdgpu_testing & 0x2) ? true : false;
+			break;
+		default:
+			break;
+	}
+	return r;
 }
 
 static bool nv_need_reset_on_init(struct amdgpu_device *adev)
 {
 	u32 sol_reg;
 
-	if (adev->flags & AMD_IS_APU)
+	if (adev->flags & AMD_IS_APU || adev->asic_type == CHIP_VANGOGH_LITE)
 		return false;
 
 	/* Check sOS sign of life register to confirm sys driver and sOS
@@ -969,6 +970,8 @@ static void nv_init_doorbell_index(struct amdgpu_device *adev)
 	adev->doorbell_index.userqueue_end = AMDGPU_NAVI10_DOORBELL_USERQUEUE_END;
 	adev->doorbell_index.gfx_ring0 = AMDGPU_NAVI10_DOORBELL_GFX_RING0;
 	adev->doorbell_index.gfx_ring1 = AMDGPU_NAVI10_DOORBELL_GFX_RING1;
+	adev->doorbell_index.gfx_ring2 = AMDGPU_NAVI10_DOORBELL_GFX_RING2;
+	adev->doorbell_index.gfx_ring3 = AMDGPU_NAVI10_DOORBELL_GFX_RING3;
 	adev->doorbell_index.mes_ring = AMDGPU_NAVI10_DOORBELL_MES_RING;
 	adev->doorbell_index.sdma_engine[0] = AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0;
 	adev->doorbell_index.sdma_engine[1] = AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE1;
@@ -981,6 +984,9 @@ static void nv_init_doorbell_index(struct amdgpu_device *adev)
 	adev->doorbell_index.vcn.vcn_ring6_7 = AMDGPU_NAVI10_DOORBELL64_VCN6_7;
 	adev->doorbell_index.first_non_cp = AMDGPU_NAVI10_DOORBELL64_FIRST_NON_CP;
 	adev->doorbell_index.last_non_cp = AMDGPU_NAVI10_DOORBELL64_LAST_NON_CP;
+
+	adev->doorbell_index.first_resv = AMDGPU_NAVI10_DOORBELL64_FIRST_RESV;
+	adev->doorbell_index.last_resv = AMDGPU_NAVI10_DOORBELL64_LAST_RESV;
 
 	adev->doorbell_index.max_assignment = AMDGPU_NAVI10_DOORBELL_MAX_ASSIGNMENT << 1;
 	adev->doorbell_index.sdma_doorbell_range = 20;
@@ -1008,6 +1014,36 @@ static int nv_update_umd_stable_pstate(struct amdgpu_device *adev,
 	return 0;
 }
 
+#if defined(CONFIG_DRM_AMDGPU_DUMP)
+static size_t nv_get_asic_status(struct amdgpu_device *adev,
+				 char *buf, size_t len)
+{
+	unsigned int i;
+	struct amdgpu_ring *ring;
+	size_t size;
+
+	size = snprintf(buf, len, "******DUMP GPU STATUS START******\n");
+
+	if (adev->gmc.gmc_funcs->get_gmc_status)
+		size += adev->gmc.gmc_funcs->get_gmc_status(adev,
+							    buf + size,
+							    len  - size);
+
+	for (i = 0; i < adev->num_rings; i++) {
+		ring = adev->rings[i];
+		if (ring->funcs->get_ring_status)
+			size += ring->funcs->get_ring_status(ring,
+							     buf + size,
+							     len - size);
+	}
+
+	size += snprintf(buf + size, len - size,
+			 "******DUMP GPU STATUS_END******\n");
+
+	return size;
+}
+#endif /* cONFIG_DRM_AMDGPU_DUMP */
+
 static const struct amdgpu_asic_funcs nv_asic_funcs =
 {
 	.read_disabled_bios = &nv_read_disabled_bios,
@@ -1024,10 +1060,12 @@ static const struct amdgpu_asic_funcs nv_asic_funcs =
 	.need_full_reset = &nv_need_full_reset,
 	.need_reset_on_init = &nv_need_reset_on_init,
 	.get_pcie_replay_count = &nv_get_pcie_replay_count,
-	.supports_baco = &amdgpu_dpm_is_baco_supported,
 	.pre_asic_init = &nv_pre_asic_init,
 	.update_umd_stable_pstate = &nv_update_umd_stable_pstate,
 	.query_video_codecs = &nv_query_video_codecs,
+#if defined(CONFIG_DRM_AMDGPU_DUMP)
+	.get_asic_status = &nv_get_asic_status,
+#endif
 };
 
 static int nv_common_early_init(void *handle)
@@ -1055,73 +1093,20 @@ static int nv_common_early_init(void *handle)
 
 	adev->asic_funcs = &nv_asic_funcs;
 
-	adev->rev_id = nv_get_rev_id(adev);
+
 	adev->external_rev_id = 0xff;
 	switch (adev->asic_type) {
 	case CHIP_NAVI10:
-		adev->cg_flags = AMD_CG_SUPPORT_GFX_MGCG |
-			AMD_CG_SUPPORT_GFX_CGCG |
-			AMD_CG_SUPPORT_IH_CG |
-			AMD_CG_SUPPORT_HDP_MGCG |
-			AMD_CG_SUPPORT_HDP_LS |
-			AMD_CG_SUPPORT_SDMA_MGCG |
-			AMD_CG_SUPPORT_SDMA_LS |
-			AMD_CG_SUPPORT_MC_MGCG |
-			AMD_CG_SUPPORT_MC_LS |
-			AMD_CG_SUPPORT_ATHUB_MGCG |
-			AMD_CG_SUPPORT_ATHUB_LS |
-			AMD_CG_SUPPORT_VCN_MGCG |
-			AMD_CG_SUPPORT_JPEG_MGCG |
-			AMD_CG_SUPPORT_BIF_MGCG |
-			AMD_CG_SUPPORT_BIF_LS;
-		adev->pg_flags = AMD_PG_SUPPORT_VCN |
-			AMD_PG_SUPPORT_VCN_DPG |
-			AMD_PG_SUPPORT_JPEG |
-			AMD_PG_SUPPORT_ATHUB;
 		adev->external_rev_id = adev->rev_id + 0x1;
 		break;
 	case CHIP_NAVI14:
-		adev->cg_flags = AMD_CG_SUPPORT_GFX_MGCG |
-			AMD_CG_SUPPORT_GFX_CGCG |
-			AMD_CG_SUPPORT_IH_CG |
-			AMD_CG_SUPPORT_HDP_MGCG |
-			AMD_CG_SUPPORT_HDP_LS |
-			AMD_CG_SUPPORT_SDMA_MGCG |
-			AMD_CG_SUPPORT_SDMA_LS |
-			AMD_CG_SUPPORT_MC_MGCG |
-			AMD_CG_SUPPORT_MC_LS |
-			AMD_CG_SUPPORT_ATHUB_MGCG |
-			AMD_CG_SUPPORT_ATHUB_LS |
-			AMD_CG_SUPPORT_VCN_MGCG |
-			AMD_CG_SUPPORT_JPEG_MGCG |
-			AMD_CG_SUPPORT_BIF_MGCG |
-			AMD_CG_SUPPORT_BIF_LS;
-		adev->pg_flags = AMD_PG_SUPPORT_VCN |
-			AMD_PG_SUPPORT_JPEG |
-			AMD_PG_SUPPORT_VCN_DPG;
-		adev->external_rev_id = adev->rev_id + 20;
+		if (amdgpu_eval_mode < eval_mode_config_end &&
+		    amdgpu_eval_mode > eval_mode_config_disabled)
+			adev->external_rev_id = 29; //NV14LITE
+		else
+			adev->external_rev_id = adev->rev_id + 20;
 		break;
 	case CHIP_NAVI12:
-		adev->cg_flags = AMD_CG_SUPPORT_GFX_MGCG |
-			AMD_CG_SUPPORT_GFX_MGLS |
-			AMD_CG_SUPPORT_GFX_CGCG |
-			AMD_CG_SUPPORT_GFX_CP_LS |
-			AMD_CG_SUPPORT_GFX_RLC_LS |
-			AMD_CG_SUPPORT_IH_CG |
-			AMD_CG_SUPPORT_HDP_MGCG |
-			AMD_CG_SUPPORT_HDP_LS |
-			AMD_CG_SUPPORT_SDMA_MGCG |
-			AMD_CG_SUPPORT_SDMA_LS |
-			AMD_CG_SUPPORT_MC_MGCG |
-			AMD_CG_SUPPORT_MC_LS |
-			AMD_CG_SUPPORT_ATHUB_MGCG |
-			AMD_CG_SUPPORT_ATHUB_LS |
-			AMD_CG_SUPPORT_VCN_MGCG |
-			AMD_CG_SUPPORT_JPEG_MGCG;
-		adev->pg_flags = AMD_PG_SUPPORT_VCN |
-			AMD_PG_SUPPORT_VCN_DPG |
-			AMD_PG_SUPPORT_JPEG |
-			AMD_PG_SUPPORT_ATHUB;
 		/* guest vm gets 0xffffffff when reading RCC_DEV0_EPF0_STRAP0,
 		 * as a consequence, the rev_id and external_rev_id are wrong.
 		 * workaround it by hardcoding rev_id to 0 (default value).
@@ -1131,151 +1116,42 @@ static int nv_common_early_init(void *handle)
 		adev->external_rev_id = adev->rev_id + 0xa;
 		break;
 	case CHIP_SIENNA_CICHLID:
-		adev->cg_flags = AMD_CG_SUPPORT_GFX_MGCG |
-			AMD_CG_SUPPORT_GFX_CGCG |
-			AMD_CG_SUPPORT_GFX_CGLS |
-			AMD_CG_SUPPORT_GFX_3D_CGCG |
-			AMD_CG_SUPPORT_MC_MGCG |
-			AMD_CG_SUPPORT_VCN_MGCG |
-			AMD_CG_SUPPORT_JPEG_MGCG |
-			AMD_CG_SUPPORT_HDP_MGCG |
-			AMD_CG_SUPPORT_HDP_LS |
-			AMD_CG_SUPPORT_IH_CG |
-			AMD_CG_SUPPORT_MC_LS;
-		adev->pg_flags = AMD_PG_SUPPORT_VCN |
-			AMD_PG_SUPPORT_VCN_DPG |
-			AMD_PG_SUPPORT_JPEG |
-			AMD_PG_SUPPORT_ATHUB |
-			AMD_PG_SUPPORT_MMHUB;
-		if (amdgpu_sriov_vf(adev)) {
-			/* hypervisor control CG and PG enablement */
-			adev->cg_flags = 0;
-			adev->pg_flags = 0;
-		}
 		adev->external_rev_id = adev->rev_id + 0x28;
 		break;
 	case CHIP_NAVY_FLOUNDER:
-		adev->cg_flags = AMD_CG_SUPPORT_GFX_MGCG |
-			AMD_CG_SUPPORT_GFX_CGCG |
-			AMD_CG_SUPPORT_GFX_CGLS |
-			AMD_CG_SUPPORT_GFX_3D_CGCG |
-			AMD_CG_SUPPORT_VCN_MGCG |
-			AMD_CG_SUPPORT_JPEG_MGCG |
-			AMD_CG_SUPPORT_MC_MGCG |
-			AMD_CG_SUPPORT_MC_LS |
-			AMD_CG_SUPPORT_HDP_MGCG |
-			AMD_CG_SUPPORT_HDP_LS |
-			AMD_CG_SUPPORT_IH_CG;
-		adev->pg_flags = AMD_PG_SUPPORT_VCN |
-			AMD_PG_SUPPORT_VCN_DPG |
-			AMD_PG_SUPPORT_JPEG |
-			AMD_PG_SUPPORT_ATHUB |
-			AMD_PG_SUPPORT_MMHUB;
 		adev->external_rev_id = adev->rev_id + 0x32;
 		break;
 
 	case CHIP_VANGOGH:
-		adev->cg_flags = AMD_CG_SUPPORT_GFX_MGCG |
-			AMD_CG_SUPPORT_GFX_MGLS |
-			AMD_CG_SUPPORT_GFX_CP_LS |
-			AMD_CG_SUPPORT_GFX_RLC_LS |
-			AMD_CG_SUPPORT_GFX_CGCG |
-			AMD_CG_SUPPORT_GFX_CGLS |
-			AMD_CG_SUPPORT_GFX_3D_CGCG |
-			AMD_CG_SUPPORT_GFX_3D_CGLS |
-			AMD_CG_SUPPORT_MC_MGCG |
-			AMD_CG_SUPPORT_MC_LS |
-			AMD_CG_SUPPORT_GFX_FGCG |
-			AMD_CG_SUPPORT_VCN_MGCG |
-			AMD_CG_SUPPORT_SDMA_MGCG |
-			AMD_CG_SUPPORT_SDMA_LS |
-			AMD_CG_SUPPORT_JPEG_MGCG;
-		adev->pg_flags = AMD_PG_SUPPORT_GFX_PG |
-			AMD_PG_SUPPORT_VCN |
-			AMD_PG_SUPPORT_VCN_DPG |
-			AMD_PG_SUPPORT_JPEG;
 		if (adev->apu_flags & AMD_APU_IS_VANGOGH)
 			adev->external_rev_id = adev->rev_id + 0x01;
 		break;
 	case CHIP_DIMGREY_CAVEFISH:
-		adev->cg_flags = AMD_CG_SUPPORT_GFX_MGCG |
-			AMD_CG_SUPPORT_GFX_CGCG |
-			AMD_CG_SUPPORT_GFX_CGLS |
-			AMD_CG_SUPPORT_GFX_3D_CGCG |
-			AMD_CG_SUPPORT_VCN_MGCG |
-			AMD_CG_SUPPORT_JPEG_MGCG |
-			AMD_CG_SUPPORT_MC_MGCG |
-			AMD_CG_SUPPORT_MC_LS |
-			AMD_CG_SUPPORT_HDP_MGCG |
-			AMD_CG_SUPPORT_HDP_LS |
-			AMD_CG_SUPPORT_IH_CG;
-		adev->pg_flags = AMD_PG_SUPPORT_VCN |
-			AMD_PG_SUPPORT_VCN_DPG |
-			AMD_PG_SUPPORT_JPEG |
-			AMD_PG_SUPPORT_ATHUB |
-			AMD_PG_SUPPORT_MMHUB;
 		adev->external_rev_id = adev->rev_id + 0x3c;
 		break;
 	case CHIP_BEIGE_GOBY:
-		adev->cg_flags = AMD_CG_SUPPORT_GFX_MGCG |
-			AMD_CG_SUPPORT_GFX_CGCG |
-			AMD_CG_SUPPORT_GFX_CGLS |
-			AMD_CG_SUPPORT_GFX_3D_CGCG |
-			AMD_CG_SUPPORT_MC_MGCG |
-			AMD_CG_SUPPORT_MC_LS |
-			AMD_CG_SUPPORT_HDP_MGCG |
-			AMD_CG_SUPPORT_HDP_LS |
-			AMD_CG_SUPPORT_IH_CG |
-			AMD_CG_SUPPORT_VCN_MGCG;
-		adev->pg_flags = AMD_PG_SUPPORT_VCN |
-			AMD_PG_SUPPORT_VCN_DPG |
-			AMD_PG_SUPPORT_ATHUB |
-			AMD_PG_SUPPORT_MMHUB;
 		adev->external_rev_id = adev->rev_id + 0x46;
 		break;
 	case CHIP_YELLOW_CARP:
-		adev->cg_flags = AMD_CG_SUPPORT_GFX_MGCG |
-			AMD_CG_SUPPORT_GFX_MGLS |
-			AMD_CG_SUPPORT_GFX_CGCG |
-			AMD_CG_SUPPORT_GFX_CGLS |
-			AMD_CG_SUPPORT_GFX_3D_CGCG |
-			AMD_CG_SUPPORT_GFX_3D_CGLS |
-			AMD_CG_SUPPORT_GFX_RLC_LS |
-			AMD_CG_SUPPORT_GFX_CP_LS |
-			AMD_CG_SUPPORT_GFX_FGCG |
-			AMD_CG_SUPPORT_MC_MGCG |
-			AMD_CG_SUPPORT_MC_LS |
-			AMD_CG_SUPPORT_SDMA_LS |
-			AMD_CG_SUPPORT_HDP_MGCG |
-			AMD_CG_SUPPORT_HDP_LS |
-			AMD_CG_SUPPORT_ATHUB_MGCG |
-			AMD_CG_SUPPORT_ATHUB_LS |
-			AMD_CG_SUPPORT_IH_CG |
-			AMD_CG_SUPPORT_VCN_MGCG |
-			AMD_CG_SUPPORT_JPEG_MGCG;
-		adev->pg_flags = AMD_PG_SUPPORT_GFX_PG |
-			AMD_PG_SUPPORT_VCN |
-			AMD_PG_SUPPORT_VCN_DPG |
-			AMD_PG_SUPPORT_JPEG;
 		if (adev->pdev->device == 0x1681)
 			adev->external_rev_id = 0x20;
 		else
 			adev->external_rev_id = adev->rev_id + 0x01;
 		break;
 	case CHIP_CYAN_SKILLFISH:
-		adev->cg_flags = 0;
-		adev->pg_flags = 0;
 		adev->external_rev_id = adev->rev_id + 0x82;
+		break;
+	case CHIP_VANGOGH_LITE:
+		adev->cg_flags = AMD_CG_SUPPORT_GFX_CGCG |
+			AMD_CG_SUPPORT_GFX_3D_CGCG |
+			AMD_CG_SUPPORT_GFX_MGCG |
+			AMD_CG_SUPPORT_GFX_STATIC_WGP;
+		adev->pg_flags = 0;
 		break;
 	default:
 		/* FIXME: not supported yet */
 		return -EINVAL;
 	}
-
-	if (adev->harvest_ip_mask & AMD_HARVEST_IP_VCN_MASK)
-		adev->pg_flags &= ~(AMD_PG_SUPPORT_VCN |
-				    AMD_PG_SUPPORT_VCN_DPG |
-				    AMD_PG_SUPPORT_JPEG);
 
 	if (amdgpu_sriov_vf(adev)) {
 		amdgpu_virt_init_setting(adev);
@@ -1303,6 +1179,9 @@ static int nv_common_sw_init(void *handle)
 {
 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
 
+	if (adev->asic_type == CHIP_VANGOGH_LITE)
+		return 0;
+
 	if (amdgpu_sriov_vf(adev))
 		xgpu_nv_mailbox_add_irq_id(adev);
 
@@ -1314,9 +1193,35 @@ static int nv_common_sw_fini(void *handle)
 	return 0;
 }
 
+static uint32_t amdgpu_get_family_mgfx(struct amdgpu_device *adev)
+{
+	if (AMDGPU_IS_MGFX1(adev->grbm_chip_rev) ||
+	    AMDGPU_IS_MGFX2(adev->grbm_chip_rev))
+		return AMDGPU_FAMILY_MGFX;
+	else if (AMDGPU_IS_MGFX0(adev->grbm_chip_rev))
+		return AMDGPU_FAMILY_VGH;
+	else
+		return AMDGPU_FAMILY_UNKNOWN;
+}
+
 static int nv_common_hw_init(void *handle)
 {
 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+
+	if (adev->asic_type == CHIP_VANGOGH_LITE) {
+		adev->family = amdgpu_get_family_mgfx(adev);
+		adev->rev_id = nv_get_rev_id(adev);
+
+		/* PAL needs raw value of mmGRBM_CHIP_REVISION  for M2 */
+		if (AMDGPU_IS_MGFX2(adev->grbm_chip_rev))
+			adev->external_rev_id = adev->grbm_chip_rev;
+		else if (AMDGPU_IS_MGFX1(adev->grbm_chip_rev))
+			adev->external_rev_id = 0x0A; /* MGFX1 */
+		else if (AMDGPU_IS_MGFX0(adev->grbm_chip_rev))
+			adev->external_rev_id = adev->rev_id + 0x80; /* M0 */
+		else
+			return -EINVAL;
+	}
 
 	if (adev->nbio.funcs->apply_lc_spc_mode_wa)
 		adev->nbio.funcs->apply_lc_spc_mode_wa(adev);

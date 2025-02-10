@@ -269,6 +269,8 @@ static void amdgpu_irq_handle_ih_soft(struct work_struct *work)
  */
 static bool amdgpu_msi_ok(struct amdgpu_device *adev)
 {
+	if (!adev->pdev)
+		return false;
 	if (amdgpu_msi == 1)
 		return true;
 	else if (amdgpu_msi == 0)
@@ -306,7 +308,20 @@ static void amdgpu_restore_msix(struct amdgpu_device *adev)
 int amdgpu_irq_init(struct amdgpu_device *adev)
 {
 	int r = 0;
-	unsigned int irq;
+	unsigned int irq, afm_irq;
+
+	if (adev->pldev) {
+		irq = platform_get_irq(adev->pldev, 0);
+		DRM_INFO("irq number: %d\n", irq);
+		if (irq < 0)
+			return irq;
+		/* afm interrupt set */
+		afm_irq = platform_get_irq(adev->pldev, 1);
+		DRM_INFO("afm irq number: %d\n", afm_irq);
+		if (afm_irq < 0)
+			return afm_irq;
+		adev->afm_irq = afm_irq;
+	}
 
 	spin_lock_init(&adev->irq.lock);
 
@@ -317,7 +332,8 @@ int amdgpu_irq_init(struct amdgpu_device *adev)
 		int nvec = pci_msix_vec_count(adev->pdev);
 		unsigned int flags;
 
-		if (nvec <= 0) {
+		/* Only MSI is supported on Gopher */
+		if (amdgpu_emu_mode || nvec <= 0) {
 			flags = PCI_IRQ_MSI;
 		} else {
 			flags = PCI_IRQ_MSI | PCI_IRQ_MSIX;
@@ -349,12 +365,6 @@ int amdgpu_irq_init(struct amdgpu_device *adev)
 	INIT_WORK(&adev->irq.ih2_work, amdgpu_irq_handle_ih2);
 	INIT_WORK(&adev->irq.ih_soft_work, amdgpu_irq_handle_ih_soft);
 
-	/* Use vector 0 for MSI-X. */
-	r = pci_irq_vector(adev->pdev, 0);
-	if (r < 0)
-		return r;
-	irq = r;
-
 	/* PCI devices require shared interrupts. */
 	r = request_irq(irq, amdgpu_irq_handler, IRQF_SHARED, adev_to_drm(adev)->driver->name,
 			adev_to_drm(adev));
@@ -363,6 +373,7 @@ int amdgpu_irq_init(struct amdgpu_device *adev)
 			flush_work(&adev->hotplug_work);
 		return r;
 	}
+
 	adev->irq.installed = true;
 	adev->irq.irq = irq;
 	adev_to_drm(adev)->max_vblank_count = 0x00ffffff;

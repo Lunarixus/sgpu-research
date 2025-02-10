@@ -1,5 +1,5 @@
 /*
- * Copyright 2008 Advanced Micro Devices, Inc.
+ * Copyright 2008-2021 Advanced Micro Devices, Inc.
  * Copyright 2008 Red Hat Inc.
  * Copyright 2009 Jerome Glisse.
  *
@@ -29,12 +29,13 @@
 #include <linux/pm_runtime.h>
 
 #include "amdgpu.h"
-#include "amdgpu_pm.h"
-#include "amdgpu_dm_debugfs.h"
 #include "amdgpu_ras.h"
 #include "amdgpu_rap.h"
 #include "amdgpu_securedisplay.h"
+#include "sgpu_debugfs.h"
 #include "amdgpu_fw_attestation.h"
+#include "amdgpu_sws.h"
+#include "amdgpu_cwsr.h"
 
 #if defined(CONFIG_DEBUG_FS)
 
@@ -138,9 +139,6 @@ static int  amdgpu_debugfs_process_reg_op(bool read, struct file *f,
 		amdgpu_gfx_select_me_pipe_q(adev, me, pipe, queue, vmid);
 	}
 
-	if (pm_pg_lock)
-		mutex_lock(&adev->pm.mutex);
-
 	while (size) {
 		uint32_t value;
 
@@ -171,9 +169,6 @@ end:
 		amdgpu_gfx_select_me_pipe_q(adev, 0, 0, 0, 0);
 		mutex_unlock(&adev->srbm_mutex);
 	}
-
-	if (pm_pg_lock)
-		mutex_unlock(&adev->pm.mutex);
 
 	pm_runtime_mark_last_busy(adev_to_drm(adev)->dev);
 	pm_runtime_put_autosuspend(adev_to_drm(adev)->dev);
@@ -342,9 +337,6 @@ static ssize_t amdgpu_debugfs_regs_didt_read(struct file *f, char __user *buf,
 	if (size & 0x3 || *pos & 0x3)
 		return -EINVAL;
 
-	if (!adev->didt_rreg)
-		return -EOPNOTSUPP;
-
 	r = pm_runtime_get_sync(adev_to_drm(adev)->dev);
 	if (r < 0) {
 		pm_runtime_put_autosuspend(adev_to_drm(adev)->dev);
@@ -404,9 +396,6 @@ static ssize_t amdgpu_debugfs_regs_didt_write(struct file *f, const char __user 
 	if (size & 0x3 || *pos & 0x3)
 		return -EINVAL;
 
-	if (!adev->didt_wreg)
-		return -EOPNOTSUPP;
-
 	r = pm_runtime_get_sync(adev_to_drm(adev)->dev);
 	if (r < 0) {
 		pm_runtime_put_autosuspend(adev_to_drm(adev)->dev);
@@ -463,9 +452,6 @@ static ssize_t amdgpu_debugfs_regs_smc_read(struct file *f, char __user *buf,
 	struct amdgpu_device *adev = file_inode(f)->i_private;
 	ssize_t result = 0;
 	int r;
-
-	if (!adev->smc_rreg)
-		return -EOPNOTSUPP;
 
 	if (size & 0x3 || *pos & 0x3)
 		return -EINVAL;
@@ -525,9 +511,6 @@ static ssize_t amdgpu_debugfs_regs_smc_write(struct file *f, const char __user *
 	struct amdgpu_device *adev = file_inode(f)->i_private;
 	ssize_t result = 0;
 	int r;
-
-	if (!adev->smc_wreg)
-		return -EOPNOTSUPP;
 
 	if (size & 0x3 || *pos & 0x3)
 		return -EINVAL;
@@ -600,7 +583,7 @@ static ssize_t amdgpu_debugfs_gca_config_read(struct file *f, char __user *buf,
 		return -ENOMEM;
 
 	/* version, increment each time something is added */
-	config[no_regs++] = 3;
+	config[no_regs++] = 2;
 	config[no_regs++] = adev->gfx.config.max_shader_engines;
 	config[no_regs++] = adev->gfx.config.max_tile_pipes;
 	config[no_regs++] = adev->gfx.config.max_cu_per_sh;
@@ -627,18 +610,10 @@ static ssize_t amdgpu_debugfs_gca_config_read(struct file *f, char __user *buf,
 
 	/* rev==1 */
 	config[no_regs++] = adev->rev_id;
-	config[no_regs++] = adev->pg_flags;
-	config[no_regs++] = adev->cg_flags;
 
 	/* rev==2 */
 	config[no_regs++] = adev->family;
 	config[no_regs++] = adev->external_rev_id;
-
-	/* rev==3 */
-	config[no_regs++] = adev->pdev->device;
-	config[no_regs++] = adev->pdev->revision;
-	config[no_regs++] = adev->pdev->subsystem_device;
-	config[no_regs++] = adev->pdev->subsystem_vendor;
 
 	while (size && (*pos < no_regs * 4)) {
 		uint32_t value;
@@ -683,9 +658,6 @@ static ssize_t amdgpu_debugfs_sensor_read(struct file *f, char __user *buf,
 	if (size & 3 || *pos & 0x3)
 		return -EINVAL;
 
-	if (!adev->pm.dpm_enabled)
-		return -EINVAL;
-
 	/* convert offset to sensor number */
 	idx = *pos >> 2;
 
@@ -702,8 +674,6 @@ static ssize_t amdgpu_debugfs_sensor_read(struct file *f, char __user *buf,
 		pm_runtime_put_autosuspend(adev_to_drm(adev)->dev);
 		return r;
 	}
-
-	r = amdgpu_dpm_read_sensor(adev, idx, &values[0], &valuesize);
 
 	pm_runtime_mark_last_busy(adev_to_drm(adev)->dev);
 	pm_runtime_put_autosuspend(adev_to_drm(adev)->dev);
@@ -1188,7 +1158,7 @@ static int amdgpu_debugfs_evict_vram(void *data, u64 *val)
 		return r;
 	}
 
-	*val = amdgpu_ttm_evict_resources(adev, TTM_PL_VRAM);
+	*val = amdgpu_bo_evict_vram(adev);
 
 	pm_runtime_mark_last_busy(dev->dev);
 	pm_runtime_put_autosuspend(dev->dev);
@@ -1201,15 +1171,17 @@ static int amdgpu_debugfs_evict_gtt(void *data, u64 *val)
 {
 	struct amdgpu_device *adev = (struct amdgpu_device *)data;
 	struct drm_device *dev = adev_to_drm(adev);
+	struct ttm_resource_manager *man;
 	int r;
 
 	r = pm_runtime_get_sync(dev->dev);
 	if (r < 0) {
-		pm_runtime_put_autosuspend(dev->dev);
+		pm_runtime_put_autosuspend(adev_to_drm(adev)->dev);
 		return r;
 	}
 
-	*val = amdgpu_ttm_evict_resources(adev, TTM_PL_TT);
+	man = ttm_manager_type(&adev->mman.bdev, TTM_PL_TT);
+	*val = ttm_resource_manager_evict_all(&adev->mman.bdev, man);
 
 	pm_runtime_mark_last_busy(dev->dev);
 	pm_runtime_put_autosuspend(dev->dev);
@@ -1433,7 +1405,6 @@ pro_end:
 static int amdgpu_debugfs_sclk_set(void *data, u64 val)
 {
 	int ret = 0;
-	uint32_t max_freq, min_freq;
 	struct amdgpu_device *adev = (struct amdgpu_device *)data;
 
 	if (amdgpu_sriov_vf(adev) && !amdgpu_sriov_is_pp_one_vf(adev))
@@ -1443,15 +1414,6 @@ static int amdgpu_debugfs_sclk_set(void *data, u64 val)
 	if (ret < 0) {
 		pm_runtime_put_autosuspend(adev_to_drm(adev)->dev);
 		return ret;
-	}
-
-	if (is_support_sw_smu(adev)) {
-		ret = smu_get_dpm_freq_range(&adev->smu, SMU_SCLK, &min_freq, &max_freq);
-		if (ret || val > max_freq || val < min_freq)
-			return -EINVAL;
-		ret = smu_set_soft_freq_range(&adev->smu, SMU_SCLK, (uint32_t)val, (uint32_t)val);
-	} else {
-		return 0;
 	}
 
 	pm_runtime_mark_last_busy(adev_to_drm(adev)->dev);
@@ -1491,7 +1453,6 @@ int amdgpu_debugfs_init(struct amdgpu_device *adev)
 
 	/* Register debugfs entries for amdgpu_ttm */
 	amdgpu_ttm_debugfs_init(adev);
-	amdgpu_debugfs_pm_init(adev);
 	amdgpu_debugfs_sa_init(adev);
 	amdgpu_debugfs_fence_init(adev);
 	amdgpu_debugfs_gem_init(adev);
@@ -1518,6 +1479,9 @@ int amdgpu_debugfs_init(struct amdgpu_device *adev)
 		}
 	}
 
+	if (cwsr_enable || amdgpu_tmz)
+		amdgpu_sws_init_debugfs(adev);
+
 	amdgpu_ras_debugfs_create_all(adev);
 	amdgpu_rap_debugfs_init(adev);
 	amdgpu_securedisplay_debugfs_init(adev);
@@ -1537,6 +1501,14 @@ int amdgpu_debugfs_init(struct amdgpu_device *adev)
 	debugfs_create_blob("amdgpu_vbios", 0444, root,
 			    &adev->debugfs_vbios_blob);
 
+	sgpu_debugfs_jobtimeout_to_panic_init(adev);
+
+	if (sgpu_debugfs_dmsg_init(adev) != 0)
+		return -EIO;
+
+	if (sgpu_instance_data_debugfs_init(adev) != 0)
+		return -EIO;
+
 	return 0;
 }
 
@@ -1550,3 +1522,69 @@ int amdgpu_debugfs_regs_init(struct amdgpu_device *adev)
 	return 0;
 }
 #endif
+
+#if defined(CONFIG_DRM_SGPU_EXYNOS) && defined(CONFIG_DEBUG_FS)
+static int sgpu_jobtimeout_to_panic_show(struct seq_file *m, void *p)
+{
+	seq_printf(m, "%d\n", sgpu_jobtimeout_to_panic);
+	return 0;
+}
+
+static ssize_t sgpu_jobtimeout_to_panic_write(struct file *f, const char __user *data,
+				     size_t len, loff_t *loff)
+{
+	char buf = '0';
+	const size_t buf_size = 1;
+
+	if (copy_from_user(&buf, data, buf_size))
+		return -1;
+
+	if (buf == '0')
+		sgpu_jobtimeout_to_panic = 0;
+	else if (buf == '1')
+		sgpu_jobtimeout_to_panic = 1;
+	else
+		return -1;
+
+	return len;
+}
+
+static int sgpu_jobtimeout_to_panic_open(struct inode *inode, struct file *f)
+{
+	return single_open(f, sgpu_jobtimeout_to_panic_show, inode->i_private);
+}
+
+static struct file_operations sgpu_debugfs_jobtimeout_to_panic_fops = {
+	.owner	 = THIS_MODULE,
+	.open	 = sgpu_jobtimeout_to_panic_open,
+	.read	 = seq_read,
+	.write   = sgpu_jobtimeout_to_panic_write,
+	.llseek  = seq_lseek,
+	.release = single_release
+};
+
+int sgpu_debugfs_jobtimeout_to_panic_init(struct amdgpu_device *adev)
+{
+	struct drm_minor *minor = adev_to_drm(adev)->primary;
+	struct dentry *ent, *root = minor->debugfs_root;
+
+	ent = debugfs_create_file("jobtimeout_to_panic", S_IRUGO | S_IWUSR,
+				  root, adev,
+				  &sgpu_debugfs_jobtimeout_to_panic_fops);
+	if (!ent) {
+		DRM_ERROR("unable to create jobtimeout_to_panic debugfs file\n");
+		return -EIO;
+	}
+	adev->debugfs_jobtimeout_to_panic = ent;
+
+	return 0;
+}
+
+#else /* CONFIG_DRM_SGPU_EXYNOS && CONFIG_DEBUG_FS */
+int sgpu_debugfs_jobtimeout_to_panic_init(struct amdgpu_device *adev)
+{
+	return 0;
+}
+
+#endif  /* CONFIG_DRM_SGPU_EXYNOS && CONFIG_DEBUG_FS */
+

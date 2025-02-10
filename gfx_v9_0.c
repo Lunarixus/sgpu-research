@@ -1,5 +1,5 @@
 /*
- * Copyright 2016 Advanced Micro Devices, Inc.
+ * Copyright 2016, 2020 Advanced Micro Devices, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -1272,8 +1272,6 @@ static const struct amdgpu_gfxoff_quirk amdgpu_gfxoff_quirk_list[] = {
 	{ 0x1002, 0x15dd, 0x103c, 0x83e7, 0xd3 },
 	/* GFXOFF is unstable on C6 parts with a VBIOS 113-RAVEN-114 */
 	{ 0x1002, 0x15dd, 0x1002, 0x15dd, 0xc6 },
-	/* Apple MacBook Pro (15-inch, 2019) Radeon Pro Vega 20 4 GB */
-	{ 0x1002, 0x69af, 0x106b, 0x019a, 0xc0 },
 	{ 0, 0, 0, 0, 0 },
 };
 
@@ -2624,8 +2622,7 @@ static void gfx_v9_0_constants_init(struct amdgpu_device *adev)
 
 	gfx_v9_0_tiling_mode_table_init(adev);
 
-	if (adev->gfx.num_gfx_rings)
-		gfx_v9_0_setup_rb(adev);
+	gfx_v9_0_setup_rb(adev);
 	gfx_v9_0_get_cu_info(adev, &adev->gfx.cu_info);
 	adev->gfx.config.db_debug2 = RREG32_SOC15(GC, 0, mmDB_DEBUG2);
 
@@ -3064,8 +3061,8 @@ static void gfx_v9_0_init_pg(struct amdgpu_device *adev)
 			      AMD_PG_SUPPORT_CP |
 			      AMD_PG_SUPPORT_GDS |
 			      AMD_PG_SUPPORT_RLC_SMU_HS)) {
-		WREG32_SOC15(GC, 0, mmRLC_JUMP_TABLE_RESTORE,
-			     adev->gfx.rlc.cp_table_gpu_addr >> 8);
+		WREG32(mmRLC_JUMP_TABLE_RESTORE,
+		       adev->gfx.rlc.cp_table_gpu_addr >> 8);
 		gfx_v9_0_init_gfx_power_gating(adev);
 	}
 }
@@ -3268,14 +3265,6 @@ static int gfx_v9_0_cp_gfx_start(struct amdgpu_device *adev)
 
 	gfx_v9_0_cp_gfx_enable(adev, true);
 
-	/* Now only limit the quirk on the APU gfx9 series and already
-	 * confirmed that the APU gfx10/gfx11 needn't such update.
-	 */
-	if (adev->flags & AMD_IS_APU &&
-			adev->in_s3 && !adev->suspend_complete) {
-		DRM_INFO(" Will skip the CSB packet resubmit\n");
-		return 0;
-	}
 	r = amdgpu_ring_alloc(ring, gfx_v9_0_get_csb_size(adev) + 4 + 3);
 	if (r) {
 		DRM_ERROR("amdgpu: cp failed to lock ring (%d).\n", r);
@@ -3879,10 +3868,8 @@ static int gfx_v9_0_kiq_resume(struct amdgpu_device *adev)
 		return r;
 
 	r = amdgpu_bo_kmap(ring->mqd_obj, (void **)&ring->mqd_ptr);
-	if (unlikely(r != 0)) {
-		amdgpu_bo_unreserve(ring->mqd_obj);
+	if (unlikely(r != 0))
 		return r;
-	}
 
 	gfx_v9_0_kiq_init_queue(ring);
 	amdgpu_bo_kunmap(ring->mqd_obj);
@@ -4028,8 +4015,7 @@ static int gfx_v9_0_hw_fini(void *handle)
 {
 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
 
-	if (amdgpu_ras_is_supported(adev, AMDGPU_RAS_BLOCK__GFX))
-		amdgpu_irq_put(adev, &adev->gfx.cp_ecc_error_irq, 0);
+	amdgpu_irq_put(adev, &adev->gfx.cp_ecc_error_irq, 0);
 	amdgpu_irq_put(adev, &adev->gfx.priv_reg_irq, 0);
 	amdgpu_irq_put(adev, &adev->gfx.priv_inst_irq, 0);
 
@@ -5306,6 +5292,31 @@ static void gfx_v9_0_get_clockgating_state(void *handle, u32 *flags)
 	}
 }
 
+#if defined(CONFIG_DRM_AMDGPU_DUMP)
+static bool gfx_v9_0_is_power_on(void *handle)
+{
+	bool r = true;
+	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+
+	/*
+	 * GFXOFF:
+	 *   0 - OFF
+	 *   1 - going to ON
+	 *   2 - ON
+	 *   3 - going to OFF
+	 */
+	if (adev->pm.pp_feature & PP_GFXOFF_MASK) {
+		u32 rreg32 = RREG32_SOC15(PWR, 0, mmPWR_MISC_CNTL_STATUS);
+
+		if (((rreg32 & PWR_MISC_CNTL_STATUS__PWR_GFXOFF_STATUS_MASK) >>
+			PWR_MISC_CNTL_STATUS__PWR_GFXOFF_STATUS__SHIFT) != 2)
+			r = false;
+	}
+
+	return r;
+}
+#endif /* CONFIG_DRM_AMDGPU_DUMP */
+
 static u64 gfx_v9_0_ring_get_rptr_gfx(struct amdgpu_ring *ring)
 {
 	return ring->adev->wb.wb[ring->rptr_offs]; /* gfx9 is 32bit rptr*/
@@ -5728,6 +5739,359 @@ static void gfx_v9_0_ring_emit_reg_write_reg_wait(struct amdgpu_ring *ring,
 		amdgpu_ring_emit_reg_write_reg_wait_helper(ring, reg0, reg1,
 							   ref, mask);
 }
+
+#if defined(CONFIG_DRM_AMDGPU_GFX_DUMP)
+static size_t gfx_v9_0_ring_get_ring_status_gfx(struct amdgpu_ring *ring,
+						char *buf, size_t len)
+{
+	unsigned int i;
+	bool is_idle, is_pfp_halted, is_me_halted;
+	u32 temp32;
+	u32 grbm_status, grbm_status2, cp_me_cntl;
+	u64 temp64;
+	const struct amd_ip_funcs *ip_funcs;
+	struct amdgpu_device *adev = ring->adev;
+	u32 last_seq = atomic_read(&ring->fence_drv.last_seq);
+	u32 job_pending = ring->fence_drv.sync_seq - last_seq;
+	bool is_gfxoff_on = false;
+	size_t size = 0;
+
+	for (i = 0; i < adev->num_ip_blocks; i++) {
+		if (adev->ip_blocks[i].version->type != AMD_IP_BLOCK_TYPE_GFX)
+			continue;
+		ip_funcs = adev->ip_blocks[i].version->funcs;
+		if (ip_funcs->is_power_on) {
+			is_gfxoff_on = ip_funcs->is_power_on((void *)adev);
+			break;
+		}
+	}
+
+	if (!is_gfxoff_on) {
+		size = snprintf(buf, len,
+				"Ring(%s): GfxOff_power_state(OFF)\n",
+				ring->name);
+		return size;
+	}
+
+	cp_me_cntl = RREG32_SOC15(GC, 0, mmCP_ME_CNTL);
+	is_pfp_halted = (cp_me_cntl & CP_ME_CNTL__PFP_HALT_MASK);
+	is_me_halted = (cp_me_cntl & CP_ME_CNTL__ME_HALT_MASK);
+
+	grbm_status = RREG32_SOC15(GC, 0, mmGRBM_STATUS);
+	is_idle = !(grbm_status & GRBM_STATUS__GUI_ACTIVE_MASK);
+
+	size = snprintf(buf, len, "Graphics Pipe: %s\n",
+			is_idle ? "IDLE" : "BUSY");
+
+	if (grbm_status & GRBM_STATUS__GUI_ACTIVE_MASK) {
+		size += snprintf(buf + size, len - size,
+				 "GRBM_STATUS = 0x%08x\n", grbm_status);
+		grbm_status2 = RREG32_SOC15(GC, 0, mmGRBM_STATUS2);
+		size += snprintf(buf + size, len - size,
+				 "GRBM_STATUS2 = 0x%08x\n", grbm_status2);
+		size += snprintf(buf + size, len - size,
+				 "  CPF_BUSY(%lu), CPG_BUSY(%lu), CPC_BUSY(%lu)\n",
+				 ((grbm_status2 & GRBM_STATUS2__CPF_BUSY_MASK)
+					>> GRBM_STATUS2__CPF_BUSY__SHIFT),
+				 ((grbm_status2 & GRBM_STATUS2__CPG_BUSY_MASK)
+					>> GRBM_STATUS2__CPG_BUSY__SHIFT),
+				 ((grbm_status2 & GRBM_STATUS2__CPC_BUSY_MASK)
+					>> GRBM_STATUS2__CPC_BUSY__SHIFT));
+		size += snprintf(buf + size, len - size,
+				 "  VGT_BUSY(%lu), IA_BUSY(%lu)\n",
+				 ((grbm_status & GRBM_STATUS__VGT_BUSY_MASK)
+					>> GRBM_STATUS__VGT_BUSY__SHIFT),
+				 ((grbm_status & GRBM_STATUS__IA_BUSY_MASK)
+					>> GRBM_STATUS__IA_BUSY__SHIFT));
+		size += snprintf(buf + size, len - size,
+				 "  PA_BUSY(%lu), SC_BUSY(%lu), SX_BUSY(%lu)\n",
+				 ((grbm_status & GRBM_STATUS__PA_BUSY_MASK)
+					>> GRBM_STATUS__PA_BUSY__SHIFT),
+				 ((grbm_status & GRBM_STATUS__SC_BUSY_MASK)
+					>> GRBM_STATUS__SC_BUSY__SHIFT),
+				 ((grbm_status & GRBM_STATUS__SX_BUSY_MASK)
+					>> GRBM_STATUS__SX_BUSY__SHIFT));
+		size += snprintf(buf + size, len - size, "  SPI_BUSY(%lu)\n",
+				 ((grbm_status & GRBM_STATUS__SPI_BUSY_MASK)
+					>> GRBM_STATUS__SPI_BUSY__SHIFT));
+		size += snprintf(buf + size, len - size,
+				 "  TA_BUSY(%lu), TC_BUSY(%lu)\n",
+				 ((grbm_status & GRBM_STATUS__TA_BUSY_MASK)
+					>> GRBM_STATUS__TA_BUSY__SHIFT),
+				 ((grbm_status2 & GRBM_STATUS2__TC_BUSY_MASK)
+					>> GRBM_STATUS2__TC_BUSY__SHIFT));
+		size += snprintf(buf + size, len - size,
+				 "  CB_CLEAN(%lu), DB_CLEAN(%lu)\n",
+				 ((grbm_status & GRBM_STATUS__CB_CLEAN_MASK)
+					>> GRBM_STATUS__CB_CLEAN__SHIFT),
+				 ((grbm_status & GRBM_STATUS__DB_CLEAN_MASK)
+					>> GRBM_STATUS__DB_CLEAN__SHIFT));
+
+		temp32 = RREG32_SOC15(GC, 0, mmGRBM_STATUS_SE0);
+		size += snprintf(buf + size, len - size,
+				 "GRBM_STATUS_SE0 = 0x%08x\n", temp32);
+		temp32 = RREG32_SOC15(GC, 0, mmGRBM_STATUS_SE1);
+		size += snprintf(buf + size, len - size,
+				 "GRBM_STATUS_SE1 = 0x%08x\n", temp32);
+		temp32 = RREG32_SOC15(GC, 0, mmGRBM_STATUS_SE2);
+		size += snprintf(buf + size, len - size,
+				 "GRBM_STATUS_SE2 = 0x%08x\n", temp32);
+		temp32 = RREG32_SOC15(GC, 0, mmGRBM_STATUS_SE3);
+		size += snprintf(buf + size, len - size,
+				 "GRBM_STATUS_SE3 = 0x%08x\n", temp32);
+
+		if (grbm_status2 &
+			(GRBM_STATUS2__CPF_BUSY_MASK |
+			 GRBM_STATUS2__CPG_BUSY_MASK |
+			 GRBM_STATUS2__CPC_BUSY_MASK)) {
+			temp32 = RREG32_SOC15(GC, 0, mmCP_ME_CNTL);
+			size += snprintf(buf + size, len - size,
+					 "CP_ME_CNTL = 0x%08x\n", temp32);
+			temp32 = RREG32_SOC15(GC, 0, mmCP_MEC_CNTL);
+			size += snprintf(buf + size, len - size,
+					 "CP_MEC_CNTL = 0x%08x\n", temp32);
+			temp32 = RREG32_SOC15(GC, 0, mmCP_STAT);
+			size += snprintf(buf + size, len - size,
+					 "CP_STAT = 0x%08x\n", temp32);
+			temp32 = RREG32_SOC15(GC, 0, mmCP_STALLED_STAT1);
+			size += snprintf(buf + size, len - size,
+					 "CP_STALLED_STAT1 = 0x%08x\n",
+					 temp32);
+			temp32 = RREG32_SOC15(GC, 0, mmCP_STALLED_STAT2);
+			size += snprintf(buf + size, len - size,
+					 "CP_STALLED_STAT2 = 0x%08x\n",
+					 temp32);
+			temp32 = RREG32_SOC15(GC, 0, mmCP_STALLED_STAT3);
+			size += snprintf(buf + size, len - size,
+					 "CP_STALLED_STAT3 = 0x%08x\n",
+					 temp32);
+			temp32 = RREG32_SOC15(GC, 0, mmCP_CPF_STATUS);
+			size += snprintf(buf + size, len - size,
+					 "CP_CPF_STATUS = 0x%08x\n", temp32);
+			temp32 = RREG32_SOC15(GC, 0, mmCP_CPF_BUSY_STAT);
+			size += snprintf(buf + size, len - size,
+					 "CP_CPF_BUSY_STAT = 0X%08x\n",
+					 temp32);
+			temp32 = RREG32_SOC15(GC, 0, mmCP_CPF_STALLED_STAT1);
+			size += snprintf(buf + size, len - size,
+					 "CP_CPF_STALLED_STAT1 = 0x%08x\n",
+					 temp32);
+			temp32 = RREG32_SOC15(GC, 0, mmCP_CPC_STATUS);
+			size += snprintf(buf + size, len - size,
+					 "CP_CPC_STATUS = 0x%08x\n", temp32);
+			temp32 = RREG32_SOC15(GC, 0, mmCP_CPC_STALLED_STAT1);
+			size += snprintf(buf + size, len - size,
+					 "CP_CPC_STALLED_STAT1 = 0x%08x\n",
+					 temp32);
+		}
+	}
+
+	size += snprintf(buf + size, len - size,
+			 "Ring(%s): pfp(%s), me(%s), status(%s) job_pending(%u)\n",
+			 ring->name, (is_pfp_halted ? "HALTED" : "READY"),
+			 (is_me_halted ? "HALTED" : "READY"),
+			 (is_idle ? "IDLE" : "BUSY"), job_pending);
+
+	if (!is_idle || job_pending) {
+		temp32 = RREG32_SOC15(GC, 0, mmCP_RB0_BASE_HI)
+				& CP_RB0_BASE_HI__RB_BASE_HI_MASK;
+		temp64 = (((u64)temp32 << 32) |
+				RREG32_SOC15(GC, 0, mmCP_RB0_BASE)) << 8;
+		size += snprintf(buf + size, len - size,
+				 "  GPUAddress (sw,hw): (0x%016llx, 0x%016llx)\n",
+				 ring->gpu_addr, temp64);
+
+		temp32 = RREG32_SOC15(GC, 0, mmCP_RB0_CNTL) &
+				CP_RB0_CNTL__RB_BUFSZ_MASK;
+		temp32 = 1 << (temp32 + 1);
+		size += snprintf(buf + size, len - size,
+				 "  RB Size(sw,hw): (0x%08x,0x%08x)\n",
+				 (ring->ring_size >> 2), temp32);
+
+		temp32 = RREG32_SOC15(GC, 0, mmCP_RB0_RPTR) &
+				CP_RB0_RPTR__RB_RPTR_MASK;
+		size += snprintf(buf + size, len - size,
+				 "  RPTR: 0x%08x\n", temp32);
+
+		temp32 = RREG32_SOC15(GC, 0, mmCP_RB0_WPTR_HI);
+		temp64 = ((u64)temp32 << 32) |
+				RREG32_SOC15(GC, 0, mmCP_RB0_WPTR);
+		size += snprintf(buf + size, len - size,
+				 "  WPTR(sw,hw): (0x%016llx,0x%016llx)\n",
+				 ring->wptr, temp64);
+
+		temp32 = (RREG32_SOC15(GC, 0, mmCP_IB1_BASE_HI) &
+				CP_IB1_BASE_HI__IB1_BASE_HI_MASK);
+		temp64 = ((uint64_t)temp32 << 32) |
+				RREG32_SOC15(GC, 0, mmCP_IB1_BASE_LO);
+		size += snprintf(buf + size, len - size,
+				 "  IB1 Base addr = 0x%016llx\n", temp64);
+
+		temp32 = RREG32_SOC15(GC, 0, mmCP_IB1_CMD_BUFSZ) &
+				CP_IB1_CMD_BUFSZ__IB1_CMD_REQSZ_MASK;
+		size += snprintf(buf + size, len - size,
+				 "  IB1 buffer size = 0x%08x\n", temp32);
+
+		temp32 = RREG32_SOC15(GC, 0, mmCP_IB2_BASE_HI) &
+				CP_IB2_BASE_HI__IB2_BASE_HI_MASK;
+		temp64 = ((uint64_t)temp32 << 32) |
+				RREG32_SOC15(GC, 0, mmCP_IB2_BASE_LO);
+		size += snprintf(buf + size, len - size,
+				 "  IB2 Base addr = 0x%016llx\n", temp64);
+
+		size += snprintf(buf + size, len - size,
+				 "  PFP Last 8 decoded header:\n");
+		for (i = 0; i < 8; i++) {
+			temp32 = RREG32_SOC15(GC, 0, mmCP_PFP_HEADER_DUMP);
+			size += snprintf(buf + size, len - size,
+					 "      0x%08x\n", temp32);
+		}
+		size += snprintf(buf + size, len - size,
+				 "    ME last 8 decoded header:\n");
+		for (i = 0; i < 8; i++) {
+			temp32 = RREG32_SOC15(GC, 0, mmCP_ME_HEADER_DUMP);
+			size += snprintf(buf + size, len - size,
+					 "      0x%08x\n", temp32);
+		}
+
+		size += snprintf(buf + size, len - size,
+				 "  Ring running frame:\n");
+		temp64 = ring->wptr - (job_pending *
+				(ring->funcs->align_mask + 1));
+		for (i = 0; i < ring->funcs->align_mask + 1; i++) {
+			temp32 = ring->ring[temp64 & ring->buf_mask];
+			size += snprintf(buf + size, len - size,
+					 "    [0x%016llx]=0x%08x\n",
+					 temp64, temp32);
+			temp64++;
+		}
+	}
+
+	return size;
+}
+#endif /* CONFIG_DRM_AMDGPU_GFX_DUMP */
+
+#if defined(CONFIG_DRM_AMDGPU_COMPUTE_DUMP)
+static size_t gfx_v9_0_ring_get_ring_status_compute(struct amdgpu_ring *ring,
+						    char *buf, size_t len)
+{
+	unsigned int i;
+	bool is_mec_halted, is_ring_mapped;
+	u32 temp32, tmp;
+	u64 temp64;
+	u32 gfxoff_status = 2;
+	struct amdgpu_device *adev = ring->adev;
+	u32 last_seq = atomic_read(&ring->fence_drv.last_seq);
+	u32 job_pending = ring->fence_drv.sync_seq - last_seq;
+	size_t size = 0;
+
+	if (adev->pg_flags & AMD_PG_SUPPORT_GFX_PG) {
+		temp32 = RREG32_SOC15(PWR, 0, mmPWR_MISC_CNTL_STATUS);
+		gfxoff_status = (temp32 &
+				PWR_MISC_CNTL_STATUS__PWR_GFXOFF_STATUS_MASK) >>
+				PWR_MISC_CNTL_STATUS__PWR_GFXOFF_STATUS__SHIFT;
+	}
+
+	/*
+	 *  GFXOFF:
+	 *    0 - OFF
+	 *    1 - going to ON
+	 *    2 - ON
+	 *    3 - going to OFF
+	 */
+	if (gfxoff_status != 2) {
+		size = snprintf(buf, len,
+				"Ring(%s): GfxOff_power_state(OFF)\n",
+				ring->name);
+		return size;
+	}
+
+	temp32 = RREG32_SOC15(GC, 0, mmCP_MEC_CNTL);
+	tmp = (ring->me == 1) ? CP_MEC_CNTL__MEC_ME1_HALT_MASK :
+		CP_MEC_CNTL__MEC_ME2_HALT_MASK;
+	is_mec_halted = (temp32 & tmp);
+
+	mutex_lock(&adev->srbm_mutex);
+	soc15_grbm_select(adev, ring->me, ring->pipe, ring->queue, 0);
+
+	temp32 = RREG32_SOC15(GC, 0, mmCP_HQD_ACTIVE);
+	is_ring_mapped = (temp32 & CP_HQD_ACTIVE__ACTIVE_MASK);
+
+	size = snprintf(buf, len,
+			"Ring(%s): mec(%s), ring(%s), job_pending(%u)\n",
+			ring->name,
+			(is_mec_halted ? "HALTED" : "READY"),
+			(is_ring_mapped ? "ENABLED" : "DISABLED"),
+			job_pending);
+
+	if (job_pending) {
+		temp32 = RREG32_SOC15(GC, 0, mmCP_HQD_PQ_BASE_HI) &
+				CP_HQD_PQ_BASE_HI__ADDR_HI_MASK;
+		temp64 = (((uint64_t)temp32 << 32) |
+				RREG32_SOC15(GC, 0, mmCP_HQD_PQ_BASE)) << 8;
+		size += snprintf(buf + size, len - size,
+				 "  GPUAddress (sw,hw): (0x%016llx, 0x%016llx)\n",
+				 ring->gpu_addr, temp64);
+
+		temp32 = RREG32_SOC15(GC, 0, mmCP_HQD_PQ_CONTROL) &
+				CP_HQD_PQ_CONTROL__QUEUE_SIZE_MASK;
+		temp32 = (1 << (temp32 + 1));
+		size += snprintf(buf + size, len - size,
+				 "  Size(sw,hw): (0x%08x,0x%08x)\n",
+				 (ring->ring_size >> 2), temp32);
+
+		temp32 = RREG32_SOC15(GC, 0, mmCP_HQD_PQ_WPTR_HI);
+		temp64 = (((uint64_t)temp32 << 32) |
+				RREG32_SOC15(GC, 0, mmCP_HQD_PQ_WPTR_LO));
+		size += snprintf(buf + size, len - size,
+				 "  WPTR(sw,hw): (0x%016llx,0x%016llx)\n",
+				 ring->wptr, temp64);
+
+		temp32 = RREG32_SOC15(GC, 0, mmCP_HQD_PQ_RPTR);
+		size += snprintf(buf + size, len - size,
+				 "  RPTR = 0x%08x\n", temp32);
+
+		temp32 = RREG32_SOC15(GC, 0, mmCP_HQD_IB_BASE_ADDR_HI) &
+				CP_HQD_IB_BASE_ADDR_HI__IB_BASE_ADDR_HI_MASK;
+		temp64 = (((uint64_t)temp32 << 32) |
+				RREG32_SOC15(GC, 0, mmCP_HQD_IB_BASE_ADDR));
+		size += snprintf(buf + size, len - size,
+				 "  IB Base Address = 0x%016llx\n", temp64);
+
+		temp32 = RREG32_SOC15(GC, 0, mmCP_HQD_IB_CONTROL);
+		size += snprintf(buf + size, len - size,
+				 "  CP_HQD_IB_CONTROL = 0x%08x\n", temp32);
+		tmp = temp32 & CP_HQD_IB_CONTROL__IB_SIZE_MASK;
+		size += snprintf(buf + size, len - size,
+				 "    IB_SIZE = 0x%08x\n", tmp);
+		tmp = (temp32 & CP_HQD_IB_CONTROL__PROCESSING_IB_MASK) >>
+				CP_HQD_IB_CONTROL__PROCESSING_IB__SHIFT;
+		size += snprintf(buf + size, len - size,
+				 "    PROCESSING_IB = %d\n", tmp);
+
+		temp32 = RREG32_SOC15(GC, 0, mmCP_HQD_IB_RPTR) &
+				CP_HQD_IB_RPTR__CONSUMED_OFFSET_MASK;
+		size += snprintf(buf + size, len - size,
+				 "  CP_HQD_IB_RPTR = 0x%08x\n", temp32);
+
+		size += snprintf(buf + size, len - size,
+				 "  MEC last 8 decoded header:\n");
+		if (ring->me == 1)
+			tmp = SOC15_REG_OFFSET(GC, 0, mmCP_MEC_ME1_HEADER_DUMP);
+		else
+			tmp = SOC15_REG_OFFSET(GC, 0, mmCP_MEC_ME2_HEADER_DUMP);
+		for (i = 0; i < 8; i++) {
+			temp32 = RREG32(tmp);
+			size += snprintf(buf + size, len - size,
+					 "    0x%08x\n", temp32);
+		}
+	}
+	soc15_grbm_select(adev, 0, 0, 0, 0);
+	mutex_unlock(&adev->srbm_mutex);
+
+	return size;
+}
+#endif /* CONFIG_DRM_AMDGPU_COMPUTE_DUMP */
 
 static void gfx_v9_0_ring_soft_recovery(struct amdgpu_ring *ring, unsigned vmid)
 {
@@ -6891,6 +7255,9 @@ static const struct amd_ip_funcs gfx_v9_0_ip_funcs = {
 	.set_clockgating_state = gfx_v9_0_set_clockgating_state,
 	.set_powergating_state = gfx_v9_0_set_powergating_state,
 	.get_clockgating_state = gfx_v9_0_get_clockgating_state,
+#if defined(CONFIG_DRM_AMDGPU_DUMP)
+	.is_power_on = gfx_v9_0_is_power_on,
+#endif
 };
 
 static const struct amdgpu_ring_funcs gfx_v9_0_ring_funcs_gfx = {
@@ -6944,6 +7311,9 @@ static const struct amdgpu_ring_funcs gfx_v9_0_ring_funcs_gfx = {
 	.emit_reg_write_reg_wait = gfx_v9_0_ring_emit_reg_write_reg_wait,
 	.soft_recovery = gfx_v9_0_ring_soft_recovery,
 	.emit_mem_sync = gfx_v9_0_emit_mem_sync,
+#if defined(CONFIG_DRM_AMDGPU_GFX_DUMP)
+	.get_ring_status = gfx_v9_0_ring_get_ring_status_gfx,
+#endif
 };
 
 static const struct amdgpu_ring_funcs gfx_v9_0_ring_funcs_compute = {
@@ -6983,6 +7353,9 @@ static const struct amdgpu_ring_funcs gfx_v9_0_ring_funcs_compute = {
 	.emit_reg_write_reg_wait = gfx_v9_0_ring_emit_reg_write_reg_wait,
 	.emit_mem_sync = gfx_v9_0_emit_mem_sync,
 	.emit_wave_limit = gfx_v9_0_emit_wave_limit,
+#if defined(CONFIG_DRM_AMDGPU_COMPUTE_DUMP)
+	.get_ring_status = gfx_v9_0_ring_get_ring_status_compute,
+#endif
 };
 
 static const struct amdgpu_ring_funcs gfx_v9_0_ring_funcs_kiq = {
@@ -7012,6 +7385,9 @@ static const struct amdgpu_ring_funcs gfx_v9_0_ring_funcs_kiq = {
 	.emit_wreg = gfx_v9_0_ring_emit_wreg,
 	.emit_reg_wait = gfx_v9_0_ring_emit_reg_wait,
 	.emit_reg_write_reg_wait = gfx_v9_0_ring_emit_reg_write_reg_wait,
+#if defined(CONFIG_DRM_AMDGPU_COMPUTE_DUMP)
+	.get_ring_status = gfx_v9_0_ring_get_ring_status_compute,
+#endif
 };
 
 static void gfx_v9_0_set_ring_funcs(struct amdgpu_device *adev)

@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 Advanced Micro Devices, Inc.
+ * Copyright 2018-2022 Advanced Micro Devices, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -46,13 +46,36 @@ struct amdgpu_ctx {
 	uint32_t			vram_lost_counter;
 	spinlock_t			ring_lock;
 	struct amdgpu_ctx_entity	*entities[AMDGPU_HW_IP_NUM][AMDGPU_MAX_ENTITY_NUM];
+	struct amdgpu_ctx_entity        *priv_entities; /* tmz and cwsr */
 	bool				preamble_presented;
 	enum drm_sched_priority		init_priority;
 	enum drm_sched_priority		override_priority;
-	struct mutex			lock;
+	int                             ctx_priority;
 	atomic_t			guilty;
 	unsigned long			ras_counter_ce;
 	unsigned long			ras_counter_ue;
+	bool                            ifh_mode;
+	bool                            secure_mode;
+
+	/* Perfcounter active in rings*/
+	u32         pc_gfx_rings;
+	u32         pc_compute_rings;
+	/* SQ Thread Trace active in rings */
+	u32         sqtt_gfx_rings;
+	u32         sqtt_compute_rings;
+
+	struct amdgpu_fpriv             *fpriv;
+
+	u64				mem_size;
+
+	bool                            cwsr; //cwsr is ready for this context
+	bool                            cwsr_init;
+
+	bool                            tmz; //TMZ res is ready
+
+	/* reused by cwsr and tmz for res in reserved kmd VM */
+	struct amdgpu_ring              *resv_ring;
+	u32                             resv_slot_idx;
 };
 
 struct amdgpu_ctx_mgr {

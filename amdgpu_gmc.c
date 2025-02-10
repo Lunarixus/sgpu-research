@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 Advanced Micro Devices, Inc.
+ * Copyright 2018-2021 Advanced Micro Devices, Inc.
  * All Rights Reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -30,6 +30,7 @@
 #include "amdgpu_gmc.h"
 #include "amdgpu_ras.h"
 #include "amdgpu_xgmi.h"
+#include "amdgpu_cwsr.h"
 
 #include <drm/drm_drv.h>
 
@@ -163,7 +164,7 @@ int amdgpu_gmc_set_pte_pde(struct amdgpu_device *adev, void *cpu_pt_addr,
 	*/
 	value = addr & 0x0000FFFFFFFFF000ULL;
 	value |= flags;
-	writeq(value, ptr + (gpu_page_idx * 8));
+	*((uint64_t *)(ptr + (gpu_page_idx * 8))) = value;
 
 	drm_dev_exit(idx);
 
@@ -514,24 +515,15 @@ void amdgpu_gmc_ras_fini(struct amdgpu_device *adev)
 		adev->hdp.ras_funcs->ras_fini(adev);
 }
 
-	/*
-	 * The latest engine allocation on gfx9/10 is:
-	 * Engine 2, 3: firmware
-	 * Engine 0, 1, 4~16: amdgpu ring,
-	 *                    subject to change when ring number changes
-	 * Engine 17: Gart flushes
-	 */
-#define GFXHUB_FREE_VM_INV_ENGS_BITMAP		0x1FFF3
-#define MMHUB_FREE_VM_INV_ENGS_BITMAP		0x1FFF3
-
 int amdgpu_gmc_allocate_vm_inv_eng(struct amdgpu_device *adev)
 {
 	struct amdgpu_ring *ring;
-	unsigned vm_inv_engs[AMDGPU_MAX_VMHUBS] =
-		{GFXHUB_FREE_VM_INV_ENGS_BITMAP, MMHUB_FREE_VM_INV_ENGS_BITMAP,
-		GFXHUB_FREE_VM_INV_ENGS_BITMAP};
 	unsigned i;
 	unsigned vmhub, inv_eng;
+	struct amdgpu_sws *sws;
+
+	if (amdgpu_in_reset(adev) || adev->in_suspend)
+		return 0;
 
 	for (i = 0; i < adev->num_rings; ++i) {
 		ring = adev->rings[i];
@@ -540,7 +532,7 @@ int amdgpu_gmc_allocate_vm_inv_eng(struct amdgpu_device *adev)
 		if (ring == &adev->mes.ring)
 			continue;
 
-		inv_eng = ffs(vm_inv_engs[vmhub]);
+		inv_eng = ffs(adev->vm_inv_engs[vmhub]);
 		if (!inv_eng) {
 			dev_err(adev->dev, "no VM inv eng for ring %s\n",
 				ring->name);
@@ -548,14 +540,43 @@ int amdgpu_gmc_allocate_vm_inv_eng(struct amdgpu_device *adev)
 		}
 
 		ring->vm_inv_eng = inv_eng - 1;
-		vm_inv_engs[vmhub] &= ~(1 << ring->vm_inv_eng);
+		adev->vm_inv_engs[vmhub] &= ~(1 << ring->vm_inv_eng);
 
-		dev_info(adev->dev, "ring %s uses VM inv eng %u on hub %u\n",
+		DRM_DEBUG("ring %s uses VM inv eng %u on hub %u\n",
 			 ring->name, ring->vm_inv_eng, ring->funcs->vmhub);
 	}
 
+#ifndef CONFIG_HSA_AMD
+	sws = &adev->sws;
+	if (amdgpu_tmz) {
+		inv_eng = ffs(adev->vm_inv_engs[AMDGPU_GFXHUB_0]);
+		if (!inv_eng) {
+			dev_warn(adev->dev, "no VM inv eng for tmz_inv_eng\n");
+			return 0;
+		}
+		sws->tmz_inv_eng = inv_eng - 1;
+		adev->vm_inv_engs[AMDGPU_GFXHUB_0] &=
+						~(1 << sws->tmz_inv_eng);
+	}
+
+	if (cwsr_enable) {
+		for (i = 0; i < AMDGPU_SWS_MAX_VMID_NUM; ++i) {
+			inv_eng = ffs(adev->vm_inv_engs[AMDGPU_GFXHUB_0]);
+			if (!inv_eng)
+				break;
+
+			//each VMID has dedicated inv eng
+			sws->inv_eng[i] = inv_eng - 1;
+			adev->vm_inv_engs[AMDGPU_GFXHUB_0] &=
+						~(1 << sws->inv_eng[i]);
+		}
+
+		sws->max_vmid_num = i;
+	}
+#endif
 	return 0;
 }
+
 
 /**
  * amdgpu_gmc_tmz_set -- check and set if a device supports TMZ
@@ -584,6 +605,7 @@ void amdgpu_gmc_tmz_set(struct amdgpu_device *adev)
 	case CHIP_NAVI12:
 	case CHIP_VANGOGH:
 	case CHIP_YELLOW_CARP:
+	case CHIP_VANGOGH_LITE:
 		/* Don't enable it by default yet.
 		 */
 		if (amdgpu_tmz < 1) {

@@ -190,6 +190,8 @@ static void mmhub_v9_4_init_tlb_regs(struct amdgpu_device *adev, int hubid)
 	tmp = REG_SET_FIELD(tmp, VMSHAREDVC0_MC_VM_MX_L1_TLB_CNTL,
 			    SYSTEM_APERTURE_UNMAPPED_ACCESS, 0);
 	tmp = REG_SET_FIELD(tmp, VMSHAREDVC0_MC_VM_MX_L1_TLB_CNTL,
+			    ECO_BITS, 0);
+	tmp = REG_SET_FIELD(tmp, VMSHAREDVC0_MC_VM_MX_L1_TLB_CNTL,
 			    MTYPE, MTYPE_UC);/* XXX for emulation. */
 	tmp = REG_SET_FIELD(tmp, VMSHAREDVC0_MC_VM_MX_L1_TLB_CNTL,
 			    ATC_EN, 1);
@@ -560,10 +562,7 @@ static void mmhub_v9_4_update_medium_grain_clock_gating(struct amdgpu_device *ad
 					mmATCL2_0_ATC_L2_MISC_CG,
 					i * MMHUB_INSTANCE_REGISTER_OFFSET);
 
-		if (enable && (adev->cg_flags & AMD_CG_SUPPORT_MC_MGCG))
-			data |= ATCL2_0_ATC_L2_MISC_CG__ENABLE_MASK;
-		else
-			data &= ~ATCL2_0_ATC_L2_MISC_CG__ENABLE_MASK;
+		data &= ~ATCL2_0_ATC_L2_MISC_CG__ENABLE_MASK;
 
 		if (def != data)
 			WREG32_SOC15_OFFSET(MMHUB, 0, mmATCL2_0_ATC_L2_MISC_CG,
@@ -574,25 +573,7 @@ static void mmhub_v9_4_update_medium_grain_clock_gating(struct amdgpu_device *ad
 					mmDAGB0_CNTL_MISC2,
 					i * MMHUB_INSTANCE_REGISTER_OFFSET +
 					j * dist);
-			if (enable &&
-			    (adev->cg_flags & AMD_CG_SUPPORT_MC_MGCG)) {
-				data1 &=
-				    ~(DAGB0_CNTL_MISC2__DISABLE_WRREQ_CG_MASK |
-				    DAGB0_CNTL_MISC2__DISABLE_WRRET_CG_MASK |
-				    DAGB0_CNTL_MISC2__DISABLE_RDREQ_CG_MASK |
-				    DAGB0_CNTL_MISC2__DISABLE_RDRET_CG_MASK |
-				    DAGB0_CNTL_MISC2__DISABLE_TLBWR_CG_MASK |
-				    DAGB0_CNTL_MISC2__DISABLE_TLBRD_CG_MASK);
-			} else {
-				data1 |=
-				    (DAGB0_CNTL_MISC2__DISABLE_WRREQ_CG_MASK |
-				    DAGB0_CNTL_MISC2__DISABLE_WRRET_CG_MASK |
-				    DAGB0_CNTL_MISC2__DISABLE_RDREQ_CG_MASK |
-				    DAGB0_CNTL_MISC2__DISABLE_RDRET_CG_MASK |
-				    DAGB0_CNTL_MISC2__DISABLE_TLBWR_CG_MASK |
-				    DAGB0_CNTL_MISC2__DISABLE_TLBRD_CG_MASK);
-			}
-
+				
 			if (def1 != data1)
 				WREG32_SOC15_OFFSET(MMHUB, 0,
 					mmDAGB0_CNTL_MISC2,
@@ -616,10 +597,7 @@ static void mmhub_v9_4_update_medium_grain_light_sleep(struct amdgpu_device *ade
 					mmATCL2_0_ATC_L2_MISC_CG,
 					i * MMHUB_INSTANCE_REGISTER_OFFSET);
 
-		if (enable && (adev->cg_flags & AMD_CG_SUPPORT_MC_LS))
-			data |= ATCL2_0_ATC_L2_MISC_CG__MEM_LS_ENABLE_MASK;
-		else
-			data &= ~ATCL2_0_ATC_L2_MISC_CG__MEM_LS_ENABLE_MASK;
+		data &= ~ATCL2_0_ATC_L2_MISC_CG__MEM_LS_ENABLE_MASK;
 
 		if (def != data)
 			WREG32_SOC15_OFFSET(MMHUB, 0, mmATCL2_0_ATC_L2_MISC_CG,

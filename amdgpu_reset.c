@@ -38,7 +38,6 @@ int amdgpu_reset_init(struct amdgpu_device *adev)
 
 	switch (adev->asic_type) {
 	case CHIP_ALDEBARAN:
-		ret = aldebaran_reset_init(adev);
 		break;
 	default:
 		break;
@@ -53,7 +52,6 @@ int amdgpu_reset_fini(struct amdgpu_device *adev)
 
 	switch (adev->asic_type) {
 	case CHIP_ALDEBARAN:
-		ret = aldebaran_reset_fini(adev);
 		break;
 	default:
 		break;

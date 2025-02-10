@@ -67,6 +67,7 @@ struct amdgpu_nbio_funcs {
 	u32 (*get_pcie_port_index_offset)(struct amdgpu_device *adev);
 	u32 (*get_pcie_port_data_offset)(struct amdgpu_device *adev);
 	u32 (*get_rev_id)(struct amdgpu_device *adev);
+	u32 (*get_chip_revision)(struct amdgpu_device *adev);
 	void (*mc_access_enable)(struct amdgpu_device *adev, bool enable);
 	u32 (*get_memsize)(struct amdgpu_device *adev);
 	void (*sdma_doorbell_range)(struct amdgpu_device *adev, int instance,

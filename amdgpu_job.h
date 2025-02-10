@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 Advanced Micro Devices, Inc.
+ * Copyright 2018, 2021 Advanced Micro Devices, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -46,6 +46,7 @@ struct amdgpu_job {
 	struct amdgpu_sync	sync;
 	struct amdgpu_sync	sched_sync;
 	struct amdgpu_ib	*ibs;
+	struct amdgpu_ctx   *ctx;
 	struct dma_fence	hw_fence;
 	struct dma_fence	*external_hw_fence;
 	uint32_t		preamble_status;
@@ -66,6 +67,22 @@ struct amdgpu_job {
 
 	/* job_run_counter >= 1 means a resubmit job */
 	uint32_t		job_run_counter;
+
+	bool			ifh_mode;
+
+	/* Job that require workaround enable/disable */
+	bool            pc_wa_enable;
+	bool            pc_wa_disable;
+	bool            sqtt_wa_enable;
+	bool            sqtt_wa_disable;
+
+	/*For unscheduled job debug */
+	struct work_struct	wait_on_scheduled_work;
+
+	/* Android T CDD kernel tracepoint */
+	struct dma_fence_cb	wt_cb;
+
+	bool			end_of_frame;
 };
 
 int amdgpu_job_alloc(struct amdgpu_device *adev, unsigned num_ibs,

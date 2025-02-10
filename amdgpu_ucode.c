@@ -389,6 +389,8 @@ amdgpu_ucode_get_load_type(struct amdgpu_device *adev, int load_type)
 	case CHIP_POLARIS12:
 	case CHIP_VEGAM:
 		return AMDGPU_FW_LOAD_SMU;
+	case CHIP_VANGOGH_LITE:
+		return AMDGPU_FW_LOAD_RLC_BACKDOOR_AUTO;
 	case CHIP_VEGA10:
 	case CHIP_RAVEN:
 	case CHIP_VEGA12:
@@ -528,11 +530,24 @@ FW_VERSION_ATTR(sos_fw_version, 0444, psp.sos.fw_version);
 FW_VERSION_ATTR(asd_fw_version, 0444, psp.asd.fw_version);
 FW_VERSION_ATTR(ta_ras_fw_version, 0444, psp.ras.feature_version);
 FW_VERSION_ATTR(ta_xgmi_fw_version, 0444, psp.xgmi.feature_version);
-FW_VERSION_ATTR(smc_fw_version, 0444, pm.fw_version);
 FW_VERSION_ATTR(sdma_fw_version, 0444, sdma.instance[0].fw_version);
 FW_VERSION_ATTR(sdma2_fw_version, 0444, sdma.instance[1].fw_version);
 FW_VERSION_ATTR(vcn_fw_version, 0444, vcn.fw_version);
-FW_VERSION_ATTR(dmcu_fw_version, 0444, dm.dmcu_fw_version);
+FW_VERSION_ATTR(sgpu_rtl_cl_number, 0444, gfx.sgpu_rtl_cl_number);
+
+static ssize_t show_sgpu_fw_version(struct device *dev,
+			struct device_attribute *attr,
+			char *buf)
+{
+	struct drm_device *ddev = dev_get_drvdata(dev);
+	struct amdgpu_device *adev = drm_to_adev(ddev);
+
+	return snprintf(buf, PAGE_SIZE, "%u.%u.%u\n",
+		adev->gfx.sgpu_fw_major_version,
+		adev->gfx.sgpu_fw_minor_version,
+		adev->gfx.sgpu_fw_option_version);
+}
+static DEVICE_ATTR(sgpu_fw_version, 0444, show_sgpu_fw_version, NULL);
 
 static struct attribute *fw_attrs[] = {
 	&dev_attr_vce_fw_version.attr, &dev_attr_uvd_fw_version.attr,
@@ -543,9 +558,9 @@ static struct attribute *fw_attrs[] = {
 	&dev_attr_mec_fw_version.attr, &dev_attr_mec2_fw_version.attr,
 	&dev_attr_sos_fw_version.attr, &dev_attr_asd_fw_version.attr,
 	&dev_attr_ta_ras_fw_version.attr, &dev_attr_ta_xgmi_fw_version.attr,
-	&dev_attr_smc_fw_version.attr, &dev_attr_sdma_fw_version.attr,
 	&dev_attr_sdma2_fw_version.attr, &dev_attr_vcn_fw_version.attr,
-	&dev_attr_dmcu_fw_version.attr, NULL
+	&dev_attr_sdma_fw_version.attr, &dev_attr_sgpu_rtl_cl_number.attr,
+	&dev_attr_sgpu_fw_version.attr, NULL
 };
 
 static const struct attribute_group fw_attr_group = {
@@ -705,6 +720,10 @@ static int amdgpu_ucode_patch_jt(struct amdgpu_firmware_info *ucode,
 
 int amdgpu_ucode_create_bo(struct amdgpu_device *adev)
 {
+	if ((adev->asic_type == CHIP_VANGOGH_LITE) &&
+		(adev->firmware.load_type == AMDGPU_FW_LOAD_RLC_BACKDOOR_AUTO))
+		return 0;
+
 	if (adev->firmware.load_type != AMDGPU_FW_LOAD_DIRECT) {
 		amdgpu_bo_create_kernel(adev, adev->firmware.fw_size, PAGE_SIZE,
 			amdgpu_sriov_vf(adev) ? AMDGPU_GEM_DOMAIN_VRAM : AMDGPU_GEM_DOMAIN_GTT,
@@ -723,7 +742,12 @@ int amdgpu_ucode_create_bo(struct amdgpu_device *adev)
 
 void amdgpu_ucode_free_bo(struct amdgpu_device *adev)
 {
-	amdgpu_bo_free_kernel(&adev->firmware.fw_buf,
+	if ((adev->asic_type == CHIP_VANGOGH_LITE) &&
+		(adev->firmware.load_type == AMDGPU_FW_LOAD_RLC_BACKDOOR_AUTO))
+		return;
+
+	if (adev->firmware.load_type != AMDGPU_FW_LOAD_DIRECT)
+		amdgpu_bo_free_kernel(&adev->firmware.fw_buf,
 		&adev->firmware.fw_buf_mc,
 		&adev->firmware.fw_buf_ptr);
 }

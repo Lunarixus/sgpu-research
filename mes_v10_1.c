@@ -273,7 +273,7 @@ static const struct amdgpu_mes_funcs mes_v10_1_funcs = {
 static int mes_v10_1_init_microcode(struct amdgpu_device *adev)
 {
 	const char *chip_name;
-	char fw_name[30];
+	char fw_name[60];
 	int err;
 	const struct mes_firmware_header_v1_0 *mes_hdr;
 	struct amdgpu_firmware_info *info;

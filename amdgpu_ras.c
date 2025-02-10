@@ -970,23 +970,7 @@ static int amdgpu_ras_error_inject_xgmi(struct amdgpu_device *adev,
 				 struct ta_ras_trigger_error_input *block_info)
 {
 	int ret;
-
-	if (amdgpu_dpm_set_df_cstate(adev, DF_CSTATE_DISALLOW))
-		dev_warn(adev->dev, "Failed to disallow df cstate");
-
-	if (amdgpu_dpm_allow_xgmi_power_down(adev, false))
-		dev_warn(adev->dev, "Failed to disallow XGMI power down");
-
 	ret = psp_ras_trigger_error(&adev->psp, block_info);
-
-	if (amdgpu_ras_intr_triggered())
-		return ret;
-
-	if (amdgpu_dpm_allow_xgmi_power_down(adev, true))
-		dev_warn(adev->dev, "Failed to allow XGMI power down");
-
-	if (amdgpu_dpm_set_df_cstate(adev, DF_CSTATE_ALLOW))
-		dev_warn(adev->dev, "Failed to allow df cstate");
 
 	return ret;
 }
@@ -1192,8 +1176,7 @@ static void amdgpu_ras_sysfs_remove_bad_page_node(struct amdgpu_device *adev)
 {
 	struct amdgpu_ras *con = amdgpu_ras_get_context(adev);
 
-	if (adev->dev->kobj.sd)
-		sysfs_remove_file_from_group(&adev->dev->kobj,
+	sysfs_remove_file_from_group(&adev->dev->kobj,
 				&con->badpages_attr.attr,
 				RAS_FS_NAME);
 }
@@ -1210,8 +1193,7 @@ static int amdgpu_ras_sysfs_remove_feature_node(struct amdgpu_device *adev)
 		.attrs = attrs,
 	};
 
-	if (adev->dev->kobj.sd)
-		sysfs_remove_group(&adev->dev->kobj, &group);
+	sysfs_remove_group(&adev->dev->kobj, &group);
 
 	return 0;
 }
@@ -1259,8 +1241,7 @@ int amdgpu_ras_sysfs_remove(struct amdgpu_device *adev,
 	if (!obj || !obj->attr_inuse)
 		return -EINVAL;
 
-	if (adev->dev->kobj.sd)
-		sysfs_remove_file_from_group(&adev->dev->kobj,
+	sysfs_remove_file_from_group(&adev->dev->kobj,
 				&obj->sysfs_attr.attr,
 				RAS_FS_NAME);
 	obj->attr_inuse = 0;
@@ -2012,9 +1993,6 @@ int amdgpu_ras_recovery_init(struct amdgpu_device *adev)
 		ret = amdgpu_ras_load_bad_pages(adev);
 		if (ret)
 			goto free;
-
-		if (adev->smu.ppt_funcs && adev->smu.ppt_funcs->send_hbm_bad_pages_num)
-			adev->smu.ppt_funcs->send_hbm_bad_pages_num(&adev->smu, con->eeprom_control.ras_num_recs);
 	}
 
 	return 0;
@@ -2488,12 +2466,6 @@ void amdgpu_ras_global_ras_isr(struct amdgpu_device *adev)
 
 bool amdgpu_ras_need_emergency_restart(struct amdgpu_device *adev)
 {
-	if (adev->asic_type == CHIP_VEGA20 &&
-	    adev->pm.fw_version <= 0x283400) {
-		return !(amdgpu_asic_reset_method(adev) == AMD_RESET_METHOD_BACO) &&
-				amdgpu_ras_intr_triggered();
-	}
-
 	return false;
 }
 

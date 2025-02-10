@@ -328,6 +328,9 @@ struct dma_buf *amdgpu_gem_prime_export(struct drm_gem_object *gobj,
  * A new GEM BO of the given DRM device, representing the memory
  * described by the given DMA-buf attachment and scatter/gather table.
  */
+#define DMA_HEAP_FLAG_UNCACHED  BIT(0)
+#define DMA_HEAP_FLAG_PROTECTED BIT(1)
+
 static struct drm_gem_object *
 amdgpu_dma_buf_create_obj(struct drm_device *dev, struct dma_buf *dma_buf)
 {
@@ -337,6 +340,13 @@ amdgpu_dma_buf_create_obj(struct drm_device *dev, struct dma_buf *dma_buf)
 	struct amdgpu_bo *bo;
 	uint64_t flags = 0;
 	int ret;
+	unsigned long dma_buf_flags;
+
+	dma_buf->ops->get_flags(dma_buf, &dma_buf_flags);
+	if (DMA_HEAP_FLAG_PROTECTED & dma_buf_flags)
+		flags |= AMDGPU_GEM_CREATE_ENCRYPTED;
+	if (DMA_HEAP_FLAG_UNCACHED & dma_buf_flags)
+		flags |= AMDGPU_GEM_CREATE_UNCACHED;
 
 	dma_resv_lock(resv, NULL);
 
@@ -384,7 +394,7 @@ amdgpu_dma_buf_move_notify(struct dma_buf_attachment *attach)
 	struct amdgpu_vm_bo_base *bo_base;
 	int r;
 
-	if (!bo->tbo.resource || bo->tbo.resource->mem_type == TTM_PL_SYSTEM)
+	if (bo->tbo.resource->mem_type == TTM_PL_SYSTEM)
 		return;
 
 	r = ttm_bo_validate(&bo->tbo, &placement, &ctx);
