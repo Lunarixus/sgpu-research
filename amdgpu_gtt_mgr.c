@@ -241,7 +241,7 @@ static bool amdgpu_gtt_mgr_compatible(struct ttm_resource_manager *man,
 }
 
 /**
- * amdgpu_gtt_mgr_debug - dump VRAM table
+ * amdgpu_gtt_mgr_debug - dump GTT allocator state
  *
  * @man: TTM memory type manager
  * @printer: DRM printer to use

@@ -22,8 +22,7 @@
  * Author : Dave Airlie <airlied@redhat.com>
  */
 
-#include <drm/amdgpu_drm.h>
-#include "amdgpu_cs.h"
+#include <drm/sgpu_drm.h>
 #include "amdgpu.h"
 
 #define CREATE_TRACE_POINTS

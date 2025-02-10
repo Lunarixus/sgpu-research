@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Advanced Micro Devices, Inc.
+ * Copyright 2019-2021 Advanced Micro Devices, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -24,12 +24,29 @@
 #ifndef __NV_H__
 #define __NV_H__
 
-#include "nbio_v2_3.h"
-
-extern const struct amdgpu_ip_block_version nv_common_ip_block;
-
 void nv_grbm_select(struct amdgpu_device *adev,
 		    u32 me, u32 pipe, u32 queue, u32 vmid);
 void nv_set_virt_ops(struct amdgpu_device *adev);
+int nv_set_ip_blocks(struct amdgpu_device *adev);
+int navi10_reg_base_init(struct amdgpu_device *adev);
+int navi14_reg_base_init(struct amdgpu_device *adev);
+int navi12_reg_base_init(struct amdgpu_device *adev);
+int sienna_cichlid_reg_base_init(struct amdgpu_device *adev);
+int vangogh_lite_reg_base_init(struct amdgpu_device *adev);
+void vangogh_lite_gc_update_median_grain_clock_gating(struct amdgpu_device *adev,
+						      bool enable);
+void vangogh_lite_gpu_reset(struct amdgpu_device *adev);
+void navi1x_soft_reset_SQG_workaround(struct amdgpu_device *adev);
 
+void vangogh_lite_gc_clock_gating_workaround(struct amdgpu_device *adev);
+void vangogh_lite_gc_perfcounter_cg_workaround(struct amdgpu_device *adev,
+					        bool enable);
+void vangogh_lite_gpu_hard_reset(struct amdgpu_device *adev);
+void vangogh_lite_gpu_soft_reset(struct amdgpu_device *adev);
+void vangogh_lite_gpu_quiesce(struct amdgpu_device *adev);
+
+void vangogh_lite_didt_enable(struct amdgpu_device *adev);
+void vangogh_lite_didt_disable(struct amdgpu_device *adev);
+void vangogh_lite_edc_enable(struct amdgpu_device *adev);
+void vangogh_lite_edc_disable(struct amdgpu_device *adev);
 #endif

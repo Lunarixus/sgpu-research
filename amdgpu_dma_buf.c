@@ -35,12 +35,47 @@
 #include "amdgpu_display.h"
 #include "amdgpu_gem.h"
 #include "amdgpu_dma_buf.h"
-#include "amdgpu_xgmi.h"
-#include <drm/amdgpu_drm.h>
+#include <drm/sgpu_drm.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-fence-array.h>
 #include <linux/pci-p2pdma.h>
-#include <linux/pm_runtime.h>
+
+MODULE_IMPORT_NS(DMA_BUF);
+/**
+ * amdgpu_gem_prime_vmap - &dma_buf_ops.vmap implementation
+ * @obj: GEM BO
+ *
+ * Sets up an in-kernel virtual mapping of the BO's memory.
+ *
+ * Returns:
+ * The virtual address of the mapping or an error pointer.
+ */
+void *amdgpu_gem_prime_vmap(struct drm_gem_object *obj)
+{
+	struct amdgpu_bo *bo = gem_to_amdgpu_bo(obj);
+	int ret;
+
+	ret = ttm_bo_kmap(&bo->tbo, 0, bo->tbo.resource->num_pages,
+			  &bo->dma_buf_vmap);
+	if (ret)
+		return ERR_PTR(ret);
+
+	return bo->dma_buf_vmap.virtual;
+}
+
+/**
+ * amdgpu_gem_prime_vunmap - &dma_buf_ops.vunmap implementation
+ * @obj: GEM BO
+ * @vaddr: Virtual address (unused)
+ *
+ * Tears down the in-kernel virtual mapping of the BO's memory.
+ */
+void amdgpu_gem_prime_vunmap(struct drm_gem_object *obj, void *vaddr)
+{
+	struct amdgpu_bo *bo = gem_to_amdgpu_bo(obj);
+
+	ttm_bo_kunmap(&bo->dma_buf_vmap);
+}
 
 /**
  * amdgpu_dma_buf_attach - &dma_buf_ops.attach implementation
@@ -56,20 +91,14 @@ static int amdgpu_dma_buf_attach(struct dma_buf *dmabuf,
 	struct drm_gem_object *obj = dmabuf->priv;
 	struct amdgpu_bo *bo = gem_to_amdgpu_bo(obj);
 	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
-	int r;
 
-	if (pci_p2pdma_distance(adev->pdev, attach->dev, false) < 0)
+	if (pci_p2pdma_distance_many(adev->pdev, &attach->dev, 1, true) < 0)
 		attach->peer2peer = false;
 
-	r = pm_runtime_get_sync(adev_to_drm(adev)->dev);
-	if (r < 0)
-		goto out;
+	if (attach->dev->driver == adev->dev->driver)
+		return 0;
 
 	return 0;
-
-out:
-	pm_runtime_put_autosuspend(adev_to_drm(adev)->dev);
-	return r;
 }
 
 /**
@@ -83,12 +112,6 @@ out:
 static void amdgpu_dma_buf_detach(struct dma_buf *dmabuf,
 				  struct dma_buf_attachment *attach)
 {
-	struct drm_gem_object *obj = dmabuf->priv;
-	struct amdgpu_bo *bo = gem_to_amdgpu_bo(obj);
-	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
-
-	pm_runtime_mark_last_busy(adev_to_drm(adev)->dev);
-	pm_runtime_put_autosuspend(adev_to_drm(adev)->dev);
 }
 
 /**
@@ -179,8 +202,7 @@ static struct sg_table *amdgpu_dma_buf_map(struct dma_buf_attachment *attach,
 		break;
 
 	case TTM_PL_VRAM:
-		r = amdgpu_vram_mgr_alloc_sgt(adev, bo->tbo.resource, 0,
-					      bo->tbo.base.size, attach->dev,
+		r = amdgpu_vram_mgr_alloc_sgt(adev, bo->tbo.resource, attach->dev,
 					      dir, &sgt);
 		if (r)
 			return ERR_PTR(r);
@@ -210,12 +232,17 @@ static void amdgpu_dma_buf_unmap(struct dma_buf_attachment *attach,
 				 struct sg_table *sgt,
 				 enum dma_data_direction dir)
 {
+	struct dma_buf *dma_buf = attach->dmabuf;
+	struct drm_gem_object *obj = dma_buf->priv;
+	struct amdgpu_bo *bo = gem_to_amdgpu_bo(obj);
+	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
+
 	if (sgt->sgl->page_link) {
 		dma_unmap_sgtable(attach->dev, sgt, dir, 0);
 		sg_free_table(sgt);
 		kfree(sgt);
 	} else {
-		amdgpu_vram_mgr_free_sgt(attach->dev, dir, sgt);
+		amdgpu_vram_mgr_free_sgt(adev, attach->dev, dir, sgt);
 	}
 }
 
@@ -250,8 +277,7 @@ static int amdgpu_dma_buf_begin_cpu_access(struct dma_buf *dma_buf,
 	if (unlikely(ret != 0))
 		return ret;
 
-	if (!bo->tbo.pin_count &&
-	    (bo->allowed_domains & AMDGPU_GEM_DOMAIN_GTT)) {
+	if (!bo->tbo.pin_count && (bo->allowed_domains & AMDGPU_GEM_DOMAIN_GTT)) {
 		amdgpu_bo_placement_from_domain(bo, AMDGPU_GEM_DOMAIN_GTT);
 		ret = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
 	}
@@ -313,27 +339,39 @@ struct dma_buf *amdgpu_gem_prime_export(struct drm_gem_object *gobj,
  * A new GEM BO of the given DRM device, representing the memory
  * described by the given DMA-buf attachment and scatter/gather table.
  */
+#define DMA_HEAP_FLAG_UNCACHED BIT(0)
+#define DMA_HEAP_FLAG_PROTECTED BIT(1)
 static struct drm_gem_object *
 amdgpu_dma_buf_create_obj(struct drm_device *dev, struct dma_buf *dma_buf)
 {
 	struct dma_resv *resv = dma_buf->resv;
 	struct amdgpu_device *adev = drm_to_adev(dev);
-	struct drm_gem_object *gobj;
 	struct amdgpu_bo *bo;
-	uint64_t flags = 0;
+	struct amdgpu_bo_param bp;
+	struct drm_gem_object *gobj;
 	int ret;
+	unsigned long flags = 0;
 
+	memset(&bp, 0, sizeof(bp));
+	bp.size = dma_buf->size;
+	bp.byte_align = PAGE_SIZE;
+	bp.domain = AMDGPU_GEM_DOMAIN_CPU;
+	bp.flags = 0;
+
+	dma_buf->ops->get_flags(dma_buf, &flags);
+
+	if (DMA_HEAP_FLAG_PROTECTED & flags)
+		bp.flags |= AMDGPU_GEM_CREATE_ENCRYPTED;
+
+	if (DMA_HEAP_FLAG_UNCACHED & flags)
+		bp.flags |= AMDGPU_GEM_CREATE_UNCACHED;
+
+	bp.type = ttm_bo_type_sg;
+	bp.resv = resv;
 	dma_resv_lock(resv, NULL);
-
-	if (dma_buf->ops == &amdgpu_dmabuf_ops) {
-		struct amdgpu_bo *other = gem_to_amdgpu_bo(dma_buf->priv);
-
-		flags |= other->flags & AMDGPU_GEM_CREATE_CPU_GTT_USWC;
-	}
-
 	ret = amdgpu_gem_object_create(adev, dma_buf->size, PAGE_SIZE,
-				       AMDGPU_GEM_DOMAIN_CPU, flags,
-				       ttm_bo_type_sg, resv, &gobj);
+			AMDGPU_GEM_DOMAIN_CPU,
+			bp.flags, ttm_bo_type_sg, resv, &gobj);
 	if (ret)
 		goto error;
 
@@ -369,7 +407,7 @@ amdgpu_dma_buf_move_notify(struct dma_buf_attachment *attach)
 	struct amdgpu_vm_bo_base *bo_base;
 	int r;
 
-	if (!bo->tbo.resource || bo->tbo.resource->mem_type == TTM_PL_SYSTEM)
+	if (bo->tbo.resource->mem_type == TTM_PL_SYSTEM)
 		return;
 
 	r = ttm_bo_validate(&bo->tbo, &placement, &ctx);
@@ -380,7 +418,7 @@ amdgpu_dma_buf_move_notify(struct dma_buf_attachment *attach)
 
 	for (bo_base = bo->vm_bo; bo_base; bo_base = bo_base->next) {
 		struct amdgpu_vm *vm = bo_base->vm;
-		struct dma_resv *resv = vm->root.bo->tbo.base.resv;
+		struct dma_resv *resv = vm->root.base.bo->tbo.base.resv;
 
 		if (ticket) {
 			/* When we get an error here it means that somebody
@@ -459,37 +497,4 @@ struct drm_gem_object *amdgpu_gem_prime_import(struct drm_device *dev,
 	get_dma_buf(dma_buf);
 	obj->import_attach = attach;
 	return obj;
-}
-
-/**
- * amdgpu_dmabuf_is_xgmi_accessible - Check if xgmi available for P2P transfer
- *
- * @adev: amdgpu_device pointer of the importer
- * @bo: amdgpu buffer object
- *
- * Returns:
- * True if dmabuf accessible over xgmi, false otherwise.
- */
-bool amdgpu_dmabuf_is_xgmi_accessible(struct amdgpu_device *adev,
-				      struct amdgpu_bo *bo)
-{
-	struct drm_gem_object *obj = &bo->tbo.base;
-	struct drm_gem_object *gobj;
-
-	if (obj->import_attach) {
-		struct dma_buf *dma_buf = obj->import_attach->dmabuf;
-
-		if (dma_buf->ops != &amdgpu_dmabuf_ops)
-			/* No XGMI with non AMD GPUs */
-			return false;
-
-		gobj = dma_buf->priv;
-		bo = gem_to_amdgpu_bo(gobj);
-	}
-
-	if (amdgpu_xgmi_same_hive(adev, amdgpu_ttm_adev(bo->tbo.bdev)) &&
-			(bo->preferred_domains & AMDGPU_GEM_DOMAIN_VRAM))
-		return true;
-
-	return false;
 }

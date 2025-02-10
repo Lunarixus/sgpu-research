@@ -30,14 +30,15 @@
 #ifndef AMDGPU_MODE_H
 #define AMDGPU_MODE_H
 
-#include <drm/display/drm_dp_helper.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_encoder.h>
+#include <drm/display/drm_dp_helper.h>
 #include <drm/drm_fixed.h>
 #include <drm/drm_crtc_helper.h>
 #include <drm/drm_fb_helper.h>
 #include <drm/drm_framebuffer.h>
+#include <drm/drm_plane_helper.h>
 #include <drm/drm_probe_helper.h>
 #include <linux/i2c.h>
 #include <linux/i2c-algo-bit.h>
@@ -45,8 +46,6 @@
 #include "amdgpu_irq.h"
 
 #include <drm/display/drm_dp_mst_helper.h>
-#include "modules/inc/mod_freesync.h"
-#include "amdgpu_dm_irq_params.h"
 
 struct amdgpu_bo;
 struct amdgpu_device;
@@ -58,8 +57,6 @@ struct amdgpu_hpd;
 #define to_amdgpu_connector(x) container_of(x, struct amdgpu_connector, base)
 #define to_amdgpu_encoder(x) container_of(x, struct amdgpu_encoder, base)
 #define to_amdgpu_framebuffer(x) container_of(x, struct amdgpu_framebuffer, base)
-
-#define to_dm_plane_state(x)	container_of(x, struct dm_plane_state, base)
 
 #define AMDGPU_MAX_HPD_PINS 6
 #define AMDGPU_MAX_CRTCS 6
@@ -232,6 +229,8 @@ struct amdgpu_i2c_chan {
 	struct mutex mutex;
 };
 
+struct amdgpu_fbdev;
+
 struct amdgpu_afmt {
 	bool enabled;
 	int offset;
@@ -300,11 +299,15 @@ struct amdgpu_display_funcs {
 struct amdgpu_framebuffer {
 	struct drm_framebuffer base;
 
-	uint64_t tiling_flags;
-	bool tmz_surface;
-
 	/* caching for later use */
 	uint64_t address;
+};
+
+struct amdgpu_fbdev {
+	struct drm_fb_helper helper;
+	struct amdgpu_framebuffer rfb;
+	struct list_head fbdev_list;
+	struct amdgpu_device *adev;
 };
 
 struct amdgpu_mode_info {
@@ -332,8 +335,10 @@ struct amdgpu_mode_info {
 	struct edid *bios_hardcoded_edid;
 	int bios_hardcoded_edid_size;
 
+	/* pointer to fbdev info structure */
+	struct amdgpu_fbdev *rfbdev;
 	/* firmware flags */
-	u32 firmware_flags;
+	u16 firmware_flags;
 	/* pointer to backlight encoder */
 	struct amdgpu_encoder *bl_encoder;
 	u8 bl_level; /* saved backlight level */
@@ -341,7 +346,6 @@ struct amdgpu_mode_info {
 	int			num_crtc; /* number of crtcs */
 	int			num_hpd; /* number of hpd pins */
 	int			num_dig; /* number of dig blocks */
-	bool			gpu_vm_support; /* supports display from GTT */
 	int			disp_priority;
 	const struct amdgpu_display_funcs *funcs;
 	const enum drm_plane_type *plane_type;
@@ -349,10 +353,14 @@ struct amdgpu_mode_info {
 
 #define AMDGPU_MAX_BL_LEVEL 0xFF
 
+#if defined(CONFIG_BACKLIGHT_CLASS_DEVICE) || defined(CONFIG_BACKLIGHT_CLASS_DEVICE_MODULE)
+
 struct amdgpu_backlight_privdata {
 	struct amdgpu_encoder *encoder;
 	uint8_t negative;
 };
+
+#endif
 
 struct amdgpu_atom_ss {
 	uint16_t percentage;
@@ -394,8 +402,6 @@ struct amdgpu_crtc {
 	struct amdgpu_flip_work *pflip_works;
 	enum amdgpu_flip_status pflip_status;
 	int deferred_flip_completion;
-	/* parameters access from DM IRQ handler */
-	struct dm_irq_params dm_irq_params;
 	/* pll sharing */
 	struct amdgpu_atom_ss ss;
 	bool ss_enabled;
@@ -508,18 +514,11 @@ enum amdgpu_connector_dither {
 	AMDGPU_FMT_DITHER_ENABLE = 1,
 };
 
-struct amdgpu_dm_dp_aux {
-	struct drm_dp_aux aux;
-	struct ddc_service *ddc_service;
-};
-
 struct amdgpu_i2c_adapter {
 	struct i2c_adapter base;
 
 	struct ddc_service *ddc_service;
 };
-
-#define TO_DM_AUX(x) container_of((x), struct amdgpu_dm_dp_aux, aux)
 
 struct amdgpu_connector {
 	struct drm_connector base;
@@ -549,7 +548,6 @@ struct amdgpu_mst_connector {
 	struct amdgpu_connector base;
 
 	struct drm_dp_mst_topology_mgr mst_mgr;
-	struct amdgpu_dm_dp_aux dm_dp_aux;
 	struct drm_dp_mst_port *port;
 	struct amdgpu_connector *mst_port;
 	bool is_mst_connector;
@@ -588,13 +586,15 @@ int amdgpu_display_get_crtc_scanoutpos(struct drm_device *dev,
 			int *hpos, ktime_t *stime, ktime_t *etime,
 			const struct drm_display_mode *mode);
 
+int amdgpu_display_framebuffer_init(struct drm_device *dev,
+				    struct amdgpu_framebuffer *rfb,
+				    const struct drm_mode_fb_cmd2 *mode_cmd,
+				    struct drm_gem_object *obj);
+
 int amdgpufb_remove(struct drm_device *dev, struct drm_framebuffer *fb);
 
 void amdgpu_enc_destroy(struct drm_encoder *encoder);
 void amdgpu_copy_fb(struct drm_device *dev, struct drm_gem_object *dst_obj);
-bool amdgpu_display_crtc_scaling_mode_fixup(struct drm_crtc *crtc,
-				const struct drm_display_mode *mode,
-				struct drm_display_mode *adjusted_mode);
 void amdgpu_panel_mode_fixup(struct drm_encoder *encoder,
 			     struct drm_display_mode *adjusted_mode);
 int amdgpu_display_crtc_idx_to_irq_type(struct amdgpu_device *adev, int crtc);
@@ -603,6 +603,15 @@ bool amdgpu_crtc_get_scanout_position(struct drm_crtc *crtc,
 			bool in_vblank_irq, int *vpos,
 			int *hpos, ktime_t *stime, ktime_t *etime,
 			const struct drm_display_mode *mode);
+
+/* fbdev layer */
+int amdgpu_fbdev_init(struct amdgpu_device *adev);
+void amdgpu_fbdev_fini(struct amdgpu_device *adev);
+void amdgpu_fbdev_set_suspend(struct amdgpu_device *adev, int state);
+int amdgpu_fbdev_total_size(struct amdgpu_device *adev);
+bool amdgpu_fbdev_robj_is_fb(struct amdgpu_device *adev, struct amdgpu_bo *robj);
+
+int amdgpu_align_pitch(struct amdgpu_device *adev, int width, int bpp, bool tiled);
 
 /* amdgpu_display.c */
 void amdgpu_display_print_display_setup(struct drm_device *dev);

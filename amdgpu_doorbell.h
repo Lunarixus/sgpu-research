@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 Advanced Micro Devices, Inc.
+ * Copyright 2018-2023 Advanced Micro Devices, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -52,11 +52,10 @@ struct amdgpu_doorbell_index {
 	uint32_t userqueue_end;
 	uint32_t gfx_ring0;
 	uint32_t gfx_ring1;
-	uint32_t gfx_userqueue_start;
-	uint32_t gfx_userqueue_end;
+	uint32_t gfx_ring2;
+	uint32_t gfx_ring3;
 	uint32_t sdma_engine[8];
-	uint32_t mes_ring0;
-	uint32_t mes_ring1;
+	uint32_t mes_ring;
 	uint32_t ih;
 	union {
 		struct {
@@ -78,6 +77,8 @@ struct amdgpu_doorbell_index {
 	};
 	uint32_t first_non_cp;
 	uint32_t last_non_cp;
+	uint32_t first_resv; /* reserved for tmz and cwsr */
+	uint32_t last_resv;
 	uint32_t max_assignment;
 	/* Per engine SDMA doorbell size in dword */
 	uint32_t sdma_doorbell_range;
@@ -165,7 +166,7 @@ typedef enum _AMDGPU_VEGA20_DOORBELL_ASSIGNMENT
 
 typedef enum _AMDGPU_NAVI10_DOORBELL_ASSIGNMENT
 {
-	/* Compute + GFX: 0~255 */
+	/* Compute + GFX: 0~0x110 */
 	AMDGPU_NAVI10_DOORBELL_KIQ			= 0x000,
 	AMDGPU_NAVI10_DOORBELL_HIQ			= 0x001,
 	AMDGPU_NAVI10_DOORBELL_DIQ			= 0x002,
@@ -177,20 +178,25 @@ typedef enum _AMDGPU_NAVI10_DOORBELL_ASSIGNMENT
 	AMDGPU_NAVI10_DOORBELL_MEC_RING5		= 0x008,
 	AMDGPU_NAVI10_DOORBELL_MEC_RING6		= 0x009,
 	AMDGPU_NAVI10_DOORBELL_MEC_RING7		= 0x00A,
-	AMDGPU_NAVI10_DOORBELL_MES_RING0	        = 0x00B,
-	AMDGPU_NAVI10_DOORBELL_MES_RING1		= 0x00C,
-	AMDGPU_NAVI10_DOORBELL_USERQUEUE_START		= 0x00D,
+	AMDGPU_NAVI10_DOORBELL_USERQUEUE_START		= 0x00B,
 	AMDGPU_NAVI10_DOORBELL_USERQUEUE_END		= 0x08A,
-	AMDGPU_NAVI10_DOORBELL_GFX_RING0		= 0x08B,
-	AMDGPU_NAVI10_DOORBELL_GFX_RING1		= 0x08C,
-	AMDGPU_NAVI10_DOORBELL_GFX_USERQUEUE_START	= 0x08D,
+	AMDGPU_NAVI10_DOORBELL_GFX_USERQUEUE_START	= 0x08F,
 	AMDGPU_NAVI10_DOORBELL_GFX_USERQUEUE_END	= 0x0FF,
+	AMDGPU_NAVI10_DOORBELL64_FIRST_RESV		= 0x08B,
+	AMDGPU_NAVI10_DOORBELL64_LAST_RESV		= 0x10A,
 
-	/* SDMA:256~335*/
-	AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0		= 0x100,
-	AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE1		= 0x10A,
-	AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE2		= 0x114,
-	AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE3		= 0x11E,
+	AMDGPU_NAVI10_DOORBELL_GFX_RING0		= 0x10B,
+	AMDGPU_NAVI10_DOORBELL_GFX_RING1		= 0x10C,
+	AMDGPU_NAVI10_DOORBELL_GFX_RING2		= 0x10D,
+	AMDGPU_NAVI10_DOORBELL_GFX_RING3		= 0x10E,
+	AMDGPU_NAVI10_DOORBELL_MES_RING		        = 0x10f,
+
+	/* SDMA:288~366 */
+	AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0		= 0x120,
+	AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE1		= 0x12A,
+	AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE2		= 0x12B,
+	AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE3		= 0x12C,
+
 	/* IH: 376~391 */
 	AMDGPU_NAVI10_DOORBELL_IH			= 0x178,
 	/* MMSCH: 392~407

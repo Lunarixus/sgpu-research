@@ -26,7 +26,7 @@
 #include <linux/hdmi.h>
 #include <linux/gcd.h>
 
-#include <drm/amdgpu_drm.h>
+#include <drm/sgpu_drm.h>
 #include "amdgpu.h"
 
 static const struct amdgpu_afmt_acr amdgpu_afmt_predefined_acr[] = {

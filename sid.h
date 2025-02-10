@@ -388,6 +388,7 @@
 #define		L2_CACHE_UPDATE_MODE(x)				((x) << 6)
 #define		L2_CACHE_BIGK_FRAGMENT_SIZE(x)			((x) << 15)
 #define		L2_CACHE_BIGK_ASSOCIATIVITY			(1 << 20)
+#define		L2_CACHE_4K_ASSOCIATIVITY			(1 << 31)
 #define	VM_L2_STATUS					0x503
 #define		L2_BUSY						(1 << 0)
 #define VM_CONTEXT0_CNTL				0x504

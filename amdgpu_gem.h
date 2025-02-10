@@ -23,8 +23,11 @@
 #ifndef __AMDGPU_GEM_H__
 #define __AMDGPU_GEM_H__
 
-#include <drm/amdgpu_drm.h>
+#include <drm/sgpu_drm.h>
 #include <drm/drm_gem.h>
+
+#define SUB_BO_SIZE     0
+#define ADD_BO_SIZE     1
 
 /*
  * GEM.
@@ -32,6 +35,13 @@
 
 #define AMDGPU_GEM_DOMAIN_MAX		0x3
 #define gem_to_amdgpu_bo(gobj) container_of((gobj), struct amdgpu_bo, tbo.base)
+
+#define SGPU_GEM_METADATA_FLAG_DESCRIPTOR_POOLS		(1 << 0)
+#define SGPU_GEM_METADATA_FLAG_COMMAND_BUFFERS		(1 << 1)
+#define SGPU_GEM_METADATA_FLAG_VK_MEMORIES		(1 << 2)
+#define SGPU_GEM_METADATA_FLAG_PRD_METADATA		(1 << 3)
+#define SGPU_GEM_METADATA_FLAG_VK_QUEUE			(1 << 4)
+#define SGPU_GEM_METADATA_FLAG_PIPELINES		(1 << 5)
 
 unsigned long amdgpu_gem_timeout(uint64_t timeout_ns);
 
@@ -54,6 +64,8 @@ int amdgpu_mode_dumb_mmap(struct drm_file *filp,
 
 int amdgpu_gem_create_ioctl(struct drm_device *dev, void *data,
 			    struct drm_file *filp);
+int sgpu_gem_create_ioctl(struct drm_device *dev, void *data,
+			  struct drm_file *filp);
 int amdgpu_gem_info_ioctl(struct drm_device *dev, void *data,
 			  struct drm_file *filp);
 int amdgpu_gem_userptr_ioctl(struct drm_device *dev, void *data,
@@ -71,4 +83,8 @@ int amdgpu_gem_op_ioctl(struct drm_device *dev, void *data,
 int amdgpu_gem_metadata_ioctl(struct drm_device *dev, void *data,
 				struct drm_file *filp);
 
+void amdgpu_backoff_reservation(struct ww_acquire_ctx *ticket,
+				struct list_head *list);
+
+int amdgpu_gem_bo_size(struct drm_gem_object *gobj, struct drm_file *file_priv, int flag);
 #endif

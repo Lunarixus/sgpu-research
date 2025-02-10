@@ -25,13 +25,17 @@
  *          Alex Deucher
  *          Jerome Glisse
  */
+
+/*
+* @file amdgpu_object.h
+* @copyright 2020 Samsung Electronics
+*/
+
 #ifndef __AMDGPU_OBJECT_H__
 #define __AMDGPU_OBJECT_H__
 
-#include <drm/amdgpu_drm.h>
+#include <drm/sgpu_drm.h>
 #include "amdgpu.h"
-#include "amdgpu_res_cursor.h"
-
 #ifdef CONFIG_MMU_NOTIFIER
 #include <linux/mmu_notifier.h>
 #endif
@@ -39,23 +43,15 @@
 #define AMDGPU_BO_INVALID_OFFSET	LONG_MAX
 #define AMDGPU_BO_MAX_PLACEMENTS	3
 
-/* BO flag to indicate a KFD userptr BO */
-#define AMDGPU_AMDKFD_CREATE_USERPTR_BO	(1ULL << 63)
-
-#define to_amdgpu_bo_user(abo) container_of((abo), struct amdgpu_bo_user, bo)
-#define to_amdgpu_bo_vm(abo) container_of((abo), struct amdgpu_bo_vm, bo)
-
 struct amdgpu_bo_param {
 	unsigned long			size;
 	int				byte_align;
-	u32				bo_ptr_size;
 	u32				domain;
 	u32				preferred_domain;
 	u64				flags;
 	enum ttm_bo_type		type;
 	bool				no_wait_gpu;
-	struct dma_resv			*resv;
-	void				(*destroy)(struct ttm_buffer_object *bo);
+	struct dma_resv	*resv;
 };
 
 /* bo virtual addresses in a vm */
@@ -86,8 +82,6 @@ struct amdgpu_bo_va {
 
 	/* If the mappings are cleared or filled */
 	bool				cleared;
-
-	bool				is_xgmi;
 };
 
 struct amdgpu_bo {
@@ -99,31 +93,44 @@ struct amdgpu_bo {
 	struct ttm_buffer_object	tbo;
 	struct ttm_bo_kmap_obj		kmap;
 	u64				flags;
-	/* per VM structure for page tables and with virtual addresses */
-	struct amdgpu_vm_bo_base	*vm_bo;
-	/* Constant after initialization */
-	struct amdgpu_bo		*parent;
-
-#ifdef CONFIG_MMU_NOTIFIER
-	struct mmu_interval_notifier	notifier;
-#endif
-	struct kgd_mem                  *kfd_bo;
-};
-
-struct amdgpu_bo_user {
-	struct amdgpu_bo		bo;
 	u64				tiling_flags;
 	u64				metadata_flags;
 	void				*metadata;
 	u32				metadata_size;
-
-};
-
-struct amdgpu_bo_vm {
-	struct amdgpu_bo		bo;
+	/* per VM structure for page tables and with virtual addresses */
+	struct amdgpu_vm_bo_base	*vm_bo;
+	/* Constant after initialization */
+	struct amdgpu_bo		*parent;
 	struct amdgpu_bo		*shadow;
+
+	struct ttm_bo_kmap_obj		dma_buf_vmap;
+	struct amdgpu_mn		*mn;
+
+
+#ifdef CONFIG_MMU_NOTIFIER
+	struct mmu_interval_notifier	notifier;
+#endif
+
 	struct list_head		shadow_list;
-	struct amdgpu_vm_bo_base        entries[];
+
+	struct kgd_mem                  *kfd_bo;
+
+#ifdef CONFIG_DRM_SGPU_BPMD
+	uint32_t			bpmd_packet_id;
+	/* bpmd_list
+	 *
+	 * the list is used to store all BOs that will be dumped within a BPMD
+	 * execution, user-space or kernel-space ones. This was originaly
+	 * in bo_va but was moved here so that BOs not associated with a bo_va
+	 * can be treated in the same way. It also has the advantage of having
+	 * a single dump of a BO in case multiple processes share the same
+	 * amdgpu_bo through different amdgpu_bo_va.
+	 */
+	struct list_head		bpmd_list;
+#endif	/* CONFIG_DRM_SGPU_BPMD */
+#ifdef CONFIG_DRM_SGPU_GRAPHIC_MEMORY_RECLAIM
+	struct list_head		swap_node;
+#endif
 };
 
 static inline struct amdgpu_bo *ttm_to_amdgpu_bo(struct ttm_buffer_object *tbo)
@@ -218,18 +225,18 @@ static inline u64 amdgpu_bo_mmap_offset(struct amdgpu_bo *bo)
 static inline bool amdgpu_bo_in_cpu_visible_vram(struct amdgpu_bo *bo)
 {
 	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
-	struct amdgpu_res_cursor cursor;
+	unsigned fpfn = adev->gmc.visible_vram_size >> PAGE_SHIFT;
+	struct drm_mm_node *node;
+	unsigned long pages_left;
 
 	if (bo->tbo.resource->mem_type != TTM_PL_VRAM)
 		return false;
 
-	amdgpu_res_first(bo->tbo.resource, 0, amdgpu_bo_size(bo), &cursor);
-	while (cursor.remaining) {
-		if (cursor.start < adev->gmc.visible_vram_size)
+	node = &container_of(bo->tbo.resource, struct ttm_range_mgr_node, base)->mm_nodes[0];
+	for (pages_left = bo->tbo.resource->num_pages; pages_left;
+	     pages_left -= node->size, node++)
+		if (node->start < fpfn)
 			return true;
-
-		amdgpu_res_next(&cursor, cursor.size);
-	}
 
 	return false;
 }
@@ -253,22 +260,6 @@ static inline bool amdgpu_bo_encrypted(struct amdgpu_bo *bo)
 	return bo->flags & AMDGPU_GEM_CREATE_ENCRYPTED;
 }
 
-/**
- * amdgpu_bo_shadowed - check if the BO is shadowed
- *
- * @bo: BO to be tested.
- *
- * Returns:
- * NULL if not shadowed or else return a BO pointer.
- */
-static inline struct amdgpu_bo *amdgpu_bo_shadowed(struct amdgpu_bo *bo)
-{
-	if (bo->tbo.type == ttm_bo_type_kernel)
-		return to_amdgpu_bo_vm(bo)->shadow;
-
-	return NULL;
-}
-
 bool amdgpu_bo_is_amdgpu_bo(struct ttm_buffer_object *bo);
 void amdgpu_bo_placement_from_domain(struct amdgpu_bo *abo, u32 domain);
 
@@ -283,15 +274,14 @@ int amdgpu_bo_create_kernel(struct amdgpu_device *adev,
 			    unsigned long size, int align,
 			    u32 domain, struct amdgpu_bo **bo_ptr,
 			    u64 *gpu_addr, void **cpu_addr);
+int amdgpu_bo_create_kernel_dmabuf(struct amdgpu_device *adev,
+				   struct amdgpu_bo_param *bp,
+				   struct amdgpu_bo **bo_ptr,
+				   void *vaddr, dma_addr_t dma_addr,
+				   u64 *gpu_addr);
 int amdgpu_bo_create_kernel_at(struct amdgpu_device *adev,
 			       uint64_t offset, uint64_t size, uint32_t domain,
 			       struct amdgpu_bo **bo_ptr, void **cpu_addr);
-int amdgpu_bo_create_user(struct amdgpu_device *adev,
-			  struct amdgpu_bo_param *bp,
-			  struct amdgpu_bo_user **ubo_ptr);
-int amdgpu_bo_create_vm(struct amdgpu_device *adev,
-			struct amdgpu_bo_param *bp,
-			struct amdgpu_bo_vm **ubo_ptr);
 void amdgpu_bo_free_kernel(struct amdgpu_bo **bo, u64 *gpu_addr,
 			   void **cpu_addr);
 int amdgpu_bo_kmap(struct amdgpu_bo *bo, void **ptr);
@@ -303,8 +293,12 @@ int amdgpu_bo_pin(struct amdgpu_bo *bo, u32 domain);
 int amdgpu_bo_pin_restricted(struct amdgpu_bo *bo, u32 domain,
 			     u64 min_offset, u64 max_offset);
 void amdgpu_bo_unpin(struct amdgpu_bo *bo);
+int amdgpu_bo_evict_vram(struct amdgpu_device *adev);
 int amdgpu_bo_init(struct amdgpu_device *adev);
+int amdgpu_bo_late_init(struct amdgpu_device *adev);
 void amdgpu_bo_fini(struct amdgpu_device *adev);
+int amdgpu_bo_fbdev_mmap(struct amdgpu_bo *bo,
+				struct vm_area_struct *vma);
 int amdgpu_bo_set_tiling_flags(struct amdgpu_bo *bo, u64 tiling_flags);
 void amdgpu_bo_get_tiling_flags(struct amdgpu_bo *bo, u64 *tiling_flags);
 int amdgpu_bo_set_metadata (struct amdgpu_bo *bo, void *metadata,
@@ -312,6 +306,9 @@ int amdgpu_bo_set_metadata (struct amdgpu_bo *bo, void *metadata,
 int amdgpu_bo_get_metadata(struct amdgpu_bo *bo, void *buffer,
 			   size_t buffer_size, uint32_t *metadata_size,
 			   uint64_t *flags);
+int amdgpu_bo_set_tiling_flags_and_metadata(struct amdgpu_bo *bo,
+			   void *metadata, uint32_t metadata_size,
+			   uint64_t metadata_flags, uint64_t tiling_flags);
 void amdgpu_bo_move_notify(struct ttm_buffer_object *bo,
 			   bool evict,
 			   struct ttm_resource *new_mem);
@@ -325,12 +322,10 @@ int amdgpu_bo_sync_wait_resv(struct amdgpu_device *adev, struct dma_resv *resv,
 int amdgpu_bo_sync_wait(struct amdgpu_bo *bo, void *owner, bool intr);
 u64 amdgpu_bo_gpu_offset(struct amdgpu_bo *bo);
 u64 amdgpu_bo_gpu_offset_no_check(struct amdgpu_bo *bo);
-void amdgpu_bo_get_memory(struct amdgpu_bo *bo, uint64_t *vram_mem,
-				uint64_t *gtt_mem, uint64_t *cpu_mem);
-void amdgpu_bo_add_to_shadow_list(struct amdgpu_bo_vm *vmbo);
+int amdgpu_bo_validate(struct amdgpu_bo *bo);
 int amdgpu_bo_restore_shadow(struct amdgpu_bo *shadow,
 			     struct dma_fence **fence);
-uint32_t amdgpu_bo_get_preferred_domain(struct amdgpu_device *adev,
+uint32_t amdgpu_bo_get_preferred_pin_domain(struct amdgpu_device *adev,
 					    uint32_t domain);
 
 /*
@@ -363,9 +358,8 @@ void amdgpu_sa_bo_free(struct amdgpu_device *adev,
 #if defined(CONFIG_DEBUG_FS)
 void amdgpu_sa_bo_dump_debug_info(struct amdgpu_sa_manager *sa_manager,
 					 struct seq_file *m);
-u64 amdgpu_bo_print_info(int id, struct amdgpu_bo *bo, struct seq_file *m);
 #endif
-void amdgpu_debugfs_sa_init(struct amdgpu_device *adev);
+int amdgpu_debugfs_sa_init(struct amdgpu_device *adev);
 
 bool amdgpu_bo_support_uswc(u64 bo_flags);
 

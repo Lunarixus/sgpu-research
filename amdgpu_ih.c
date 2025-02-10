@@ -25,6 +25,7 @@
 
 #include "amdgpu.h"
 #include "amdgpu_ih.h"
+#include "vangogh_lite_reg.h"
 
 /**
  * amdgpu_ih_ring_init - initialize the IH state
@@ -51,6 +52,7 @@ int amdgpu_ih_ring_init(struct amdgpu_device *adev, struct amdgpu_ih_ring *ih,
 	ih->ptr_mask = ih->ring_size - 1;
 	ih->rptr = 0;
 	ih->use_bus_addr = use_bus_addr;
+	ih->last_rptr = 0;
 
 	if (use_bus_addr) {
 		dma_addr_t dma_addr;
@@ -99,8 +101,6 @@ int amdgpu_ih_ring_init(struct amdgpu_device *adev, struct amdgpu_ih_ring *ih,
 		ih->rptr_addr = adev->wb.gpu_addr + rptr_offs * 4;
 		ih->rptr_cpu = &adev->wb.wb[rptr_offs];
 	}
-
-	init_waitqueue_head(&ih->wait_process);
 	return 0;
 }
 
@@ -115,11 +115,9 @@ int amdgpu_ih_ring_init(struct amdgpu_device *adev, struct amdgpu_ih_ring *ih,
  */
 void amdgpu_ih_ring_fini(struct amdgpu_device *adev, struct amdgpu_ih_ring *ih)
 {
-
-	if (!ih->ring)
-		return;
-
 	if (ih->use_bus_addr) {
+		if (!ih->ring)
+			return;
 
 		/* add 8 bytes for the rptr/wptr shadows and
 		 * add them to the end of the ring allocation.
@@ -165,34 +163,6 @@ void amdgpu_ih_ring_write(struct amdgpu_ih_ring *ih, const uint32_t *iv,
 }
 
 /**
- * amdgpu_ih_wait_on_checkpoint_process_ts - wait to process IVs up to checkpoint
- *
- * @adev: amdgpu_device pointer
- * @ih: ih ring to process
- *
- * Used to ensure ring has processed IVs up to the checkpoint write pointer.
- */
-int amdgpu_ih_wait_on_checkpoint_process_ts(struct amdgpu_device *adev,
-					struct amdgpu_ih_ring *ih)
-{
-	uint32_t checkpoint_wptr;
-	uint64_t checkpoint_ts;
-	long timeout = HZ;
-
-	if (!ih->enabled || adev->shutdown)
-		return -ENODEV;
-
-	checkpoint_wptr = amdgpu_ih_get_wptr(adev, ih);
-	/* Order wptr with ring data. */
-	rmb();
-	checkpoint_ts = amdgpu_ih_decode_iv_ts(adev, ih, checkpoint_wptr, -1);
-
-	return wait_event_interruptible_timeout(ih->wait_process,
-		    amdgpu_ih_ts_after(checkpoint_ts, ih->processed_timestamp) ||
-		    ih->rptr == amdgpu_ih_get_wptr(adev, ih), timeout);
-}
-
-/**
  * amdgpu_ih_process - interrupt handler
  *
  * @adev: amdgpu_device pointer
@@ -203,16 +173,42 @@ int amdgpu_ih_wait_on_checkpoint_process_ts(struct amdgpu_device *adev,
  */
 int amdgpu_ih_process(struct amdgpu_device *adev, struct amdgpu_ih_ring *ih)
 {
-	unsigned int count;
-	u32 wptr;
+	unsigned int count = AMDGPU_IH_MAX_NUM_IVS;
+	u32 wptr, reg;
 
 	if (!ih->enabled || adev->shutdown)
 		return IRQ_NONE;
 
+	/*
+	 * S5E9945-632 : ITMON Timeout error
+	 * The issue was reported that IFPO power on is hang by LH stuck.
+	 * At the moment abnormal IRQ, which comes with GPU power off state,
+	 * was appeared and it made ITMON timeout error.
+	 * This hack patch prevents HW access from abnormal IRQ and returns
+	 * like this ISR is handled.
+	 * See more details about the issue in S5E9945-632.
+	 */
+	reg = readl(adev->pm.pmu_mmio + BG3D_PWRCTL_STATUS_OFFSET);
+	if ((reg & BG3D_PWRCTL_STATUS_GPU_READY_MASK) == 0) {
+		SGPU_LOG(adev, DMSG_INFO, DMSG_ETC,
+			"ISR Skip : BG3D_PWRCTL_STATUS_OFFSET = %#010x", reg);
+		return IRQ_HANDLED;
+	}
+
+	/* Prevent power off after fence_process */
+	if (adev->ifpo.type == IFPO_HALF_AUTO)
+		sgpu_ifpo_lock(adev);
+
 	wptr = amdgpu_ih_get_wptr(adev, ih);
 
 restart_ih:
-	count  = AMDGPU_IH_MAX_NUM_IVS;
+	/* is somebody else already processing irqs? */
+	if (atomic_xchg(&ih->lock, 1)) {
+		if (adev->ifpo.type == IFPO_HALF_AUTO)
+			sgpu_ifpo_unlock(adev);
+		return IRQ_NONE;
+	}
+
 	DRM_DEBUG("%s: rptr %d, wptr %d\n", __func__, ih->rptr, wptr);
 
 	/* Order reading of wptr vs. reading of IH ring data */
@@ -224,73 +220,18 @@ restart_ih:
 	}
 
 	amdgpu_ih_set_rptr(adev, ih);
-	wake_up_all(&ih->wait_process);
+	atomic_set(&ih->lock, 0);
 
 	/* make sure wptr hasn't changed while processing */
 	wptr = amdgpu_ih_get_wptr(adev, ih);
 	if (wptr != ih->rptr)
 		goto restart_ih;
 
+	/* End of HW access in IRQ */
+	if (adev->ifpo.type == IFPO_HALF_AUTO)
+		sgpu_ifpo_unlock(adev);
+
+	ih->last_rptr = ih->rptr;
 	return IRQ_HANDLED;
 }
 
-/**
- * amdgpu_ih_decode_iv_helper - decode an interrupt vector
- *
- * @adev: amdgpu_device pointer
- * @ih: ih ring to process
- * @entry: IV entry
- *
- * Decodes the interrupt vector at the current rptr
- * position and also advance the position for Vega10
- * and later GPUs.
- */
-void amdgpu_ih_decode_iv_helper(struct amdgpu_device *adev,
-				struct amdgpu_ih_ring *ih,
-				struct amdgpu_iv_entry *entry)
-{
-	/* wptr/rptr are in bytes! */
-	u32 ring_index = ih->rptr >> 2;
-	uint32_t dw[8];
-
-	dw[0] = le32_to_cpu(ih->ring[ring_index + 0]);
-	dw[1] = le32_to_cpu(ih->ring[ring_index + 1]);
-	dw[2] = le32_to_cpu(ih->ring[ring_index + 2]);
-	dw[3] = le32_to_cpu(ih->ring[ring_index + 3]);
-	dw[4] = le32_to_cpu(ih->ring[ring_index + 4]);
-	dw[5] = le32_to_cpu(ih->ring[ring_index + 5]);
-	dw[6] = le32_to_cpu(ih->ring[ring_index + 6]);
-	dw[7] = le32_to_cpu(ih->ring[ring_index + 7]);
-
-	entry->client_id = dw[0] & 0xff;
-	entry->src_id = (dw[0] >> 8) & 0xff;
-	entry->ring_id = (dw[0] >> 16) & 0xff;
-	entry->vmid = (dw[0] >> 24) & 0xf;
-	entry->vmid_src = (dw[0] >> 31);
-	entry->timestamp = dw[1] | ((u64)(dw[2] & 0xffff) << 32);
-	entry->timestamp_src = dw[2] >> 31;
-	entry->pasid = dw[3] & 0xffff;
-	entry->pasid_src = dw[3] >> 31;
-	entry->src_data[0] = dw[4];
-	entry->src_data[1] = dw[5];
-	entry->src_data[2] = dw[6];
-	entry->src_data[3] = dw[7];
-
-	/* wptr/rptr are in bytes! */
-	ih->rptr += 32;
-}
-
-uint64_t amdgpu_ih_decode_iv_ts_helper(struct amdgpu_ih_ring *ih, u32 rptr,
-				       signed int offset)
-{
-	uint32_t iv_size = 32;
-	uint32_t ring_index;
-	uint32_t dw1, dw2;
-
-	rptr += iv_size * offset;
-	ring_index = (rptr & ih->ptr_mask) >> 2;
-
-	dw1 = le32_to_cpu(ih->ring[ring_index + 1]);
-	dw2 = le32_to_cpu(ih->ring[ring_index + 2]);
-	return dw1 | ((u64)(dw2 & 0xffff) << 32);
-}

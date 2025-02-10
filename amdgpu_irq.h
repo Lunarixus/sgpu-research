@@ -62,6 +62,7 @@ struct amdgpu_irq_src {
 	unsigned				num_types;
 	atomic_t				*enabled_types;
 	const struct amdgpu_irq_src_funcs	*funcs;
+	void *data;
 };
 
 struct amdgpu_irq_client {
@@ -103,8 +104,7 @@ struct amdgpu_irq {
 void amdgpu_irq_disable_all(struct amdgpu_device *adev);
 
 int amdgpu_irq_init(struct amdgpu_device *adev);
-void amdgpu_irq_fini_sw(struct amdgpu_device *adev);
-void amdgpu_irq_fini_hw(struct amdgpu_device *adev);
+void amdgpu_irq_fini(struct amdgpu_device *adev);
 int amdgpu_irq_add_id(struct amdgpu_device *adev,
 		      unsigned client_id, unsigned src_id,
 		      struct amdgpu_irq_src *source);

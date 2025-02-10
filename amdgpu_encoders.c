@@ -25,7 +25,7 @@
  */
 
 #include <drm/drm_crtc_helper.h>
-#include <drm/amdgpu_drm.h>
+#include <drm/sgpu_drm.h>
 #include "amdgpu.h"
 #include "amdgpu_connectors.h"
 #include "amdgpu_display.h"
@@ -222,7 +222,7 @@ bool amdgpu_dig_monitor_is_duallink(struct drm_encoder *encoder,
 	case DRM_MODE_CONNECTOR_HDMIB:
 		if (amdgpu_connector->use_digital) {
 			/* HDMI 1.3 supports up to 340 Mhz over single link */
-			if (connector->display_info.is_hdmi) {
+			if (drm_detect_hdmi_monitor(amdgpu_connector_edid(connector))) {
 				if (pixel_clock > 340000)
 					return true;
 				else
@@ -244,7 +244,7 @@ bool amdgpu_dig_monitor_is_duallink(struct drm_encoder *encoder,
 			return false;
 		else {
 			/* HDMI 1.3 supports up to 340 Mhz over single link */
-			if (connector->display_info.is_hdmi) {
+			if (drm_detect_hdmi_monitor(amdgpu_connector_edid(connector))) {
 				if (pixel_clock > 340000)
 					return true;
 				else
